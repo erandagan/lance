@@ -15,6 +15,10 @@ fn main() -> Result<(), String> {
         println!("cargo:rustc-cfg=feature=\"nightly\"");
     }
 
+    if cfg!(not(feature = "fp16kernels")) {
+        return Ok(());
+    }
+
     // Let clippy know about our custom cfg attribute
     println!("cargo::rustc-check-cfg=cfg(kernel_support, values(\"avx512\"))");
 
@@ -82,13 +86,6 @@ fn main() -> Result<(), String> {
 }
 
 fn build_f16_with_flags(suffix: &str, flags: &[&str]) -> Result<(), cc::Error> {
-    if cfg!(not(feature = "fp16kernels")) {
-        println!(
-            "cargo:warning=fp16kernels feature is not enabled, skipping build of fp16 kernels"
-        );
-        return Ok(());
-    }
-
     let mut builder = cc::Build::new();
     builder
         // We use clang #pragma to yields better vectorization
