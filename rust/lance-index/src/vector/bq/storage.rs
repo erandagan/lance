@@ -39,7 +39,6 @@ pub const SEGMENT_LENGTH: usize = 4;
 pub const SEGMENT_NUM_CODES: usize = 1 << SEGMENT_LENGTH;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(from = "RabitQuantizationMetadataOnDisk")]
 pub struct RabitQuantizationMetadata {
     // this rotate matrix is large, and lance index would store all metadata in schema metadata,
     // which is in JSON format, so we skip it in serialization and deserialization, and store it
@@ -50,30 +49,6 @@ pub struct RabitQuantizationMetadata {
     pub num_bits: u8,
     /// Whether Rabit codes are stored using the packed SIMD-friendly layout.
     pub packed: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RabitQuantizationMetadataOnDisk {
-    pub rotate_mat_position: u32,
-    pub num_bits: u8,
-    /// Legacy field used by intermediate versions of this PR.
-    #[serde(default)]
-    pub pack: Option<bool>,
-    /// Historical / current field name.
-    #[serde(default)]
-    pub packed: Option<bool>,
-}
-
-impl From<RabitQuantizationMetadataOnDisk> for RabitQuantizationMetadata {
-    fn from(value: RabitQuantizationMetadataOnDisk) -> Self {
-        let packed = value.packed.or(value.pack).unwrap_or(true);
-        Self {
-            rotate_mat: None,
-            rotate_mat_position: value.rotate_mat_position,
-            num_bits: value.num_bits,
-            packed,
-        }
-    }
 }
 
 impl DeepSizeOf for RabitQuantizationMetadata {
