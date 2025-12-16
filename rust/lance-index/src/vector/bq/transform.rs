@@ -37,6 +37,7 @@ pub struct RQTransformer {
     distance_type: DistanceType,
     centroids_norm_square: Option<Float32Array>,
     vector_column: String,
+    drop_vector_column: bool,
 }
 
 impl RQTransformer {
@@ -55,7 +56,17 @@ impl RQTransformer {
             distance_type,
             centroids_norm_square,
             vector_column: vector_column.into(),
+            drop_vector_column: true,
         }
+    }
+
+    /// Keep the residual vector column in the transformed batch.
+    ///
+    /// This is useful for build-time algorithms (e.g. HNSW) that need random access
+    /// to the residual vectors, but the column can be dropped before persisting.
+    pub fn keep_vector_column(mut self) -> Self {
+        self.drop_vector_column = false;
+        self
     }
 }
 
@@ -207,15 +218,17 @@ impl Transformer for RQTransformer {
             }
         };
 
-        let batch = batch.try_with_column(self.rq.field(), Arc::new(rq_codes))?;
-        let batch = batch
-            .try_with_column(ADD_FACTORS_FIELD.clone(), Arc::new(add_factors))?
-            .drop_column(CENTROID_DIST_COLUMN)?;
-        let batch = batch.try_with_column(SCALE_FACTORS_FIELD.clone(), Arc::new(scale_factors))?;
+        let mut batch = batch.try_with_column(self.rq.field(), Arc::new(rq_codes))?;
+        batch = batch.try_with_column(ADD_FACTORS_FIELD.clone(), Arc::new(add_factors))?;
+        batch = batch.try_with_column(SCALE_FACTORS_FIELD.clone(), Arc::new(scale_factors))?;
 
-        let batch = batch
-            .drop_column(&self.vector_column)?
-            .drop_column(CENTROID_DIST_COLUMN)?;
+        // `CENTROID_DIST_COLUMN` is an intermediate value for quantization only.
+        batch = batch.drop_column(CENTROID_DIST_COLUMN)?;
+
+        if self.drop_vector_column {
+            batch = batch.drop_column(&self.vector_column)?;
+        }
+
         Ok(batch)
     }
 }

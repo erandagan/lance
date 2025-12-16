@@ -1832,6 +1832,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_ivf_hnsw_rq_drops_residual_vector_column_from_index_files() {
+        let test_dir = TempStrDir::default();
+        let test_uri = test_dir.as_str();
+        let (mut dataset, _) = generate_test_dataset::<Float32Type>(test_uri, 0.0..1.0).await;
+
+        let nlist = 4;
+        let ivf_params = IvfBuildParams::new(nlist);
+        let hnsw_params = HnswBuildParams::default();
+        let rq_params = RQBuildParams::new(1);
+        let params = VectorIndexParams::with_ivf_hnsw_rq_params(
+            DistanceType::L2,
+            ivf_params,
+            hnsw_params,
+            rq_params,
+        );
+
+        dataset
+            .create_index(
+                &["vector"],
+                IndexType::Vector,
+                Some("test_index".to_owned()),
+                &params,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let indices = dataset.load_indices().await.unwrap();
+        let uuid = indices
+            .iter()
+            .find(|idx| idx.name == "test_index")
+            .unwrap()
+            .uuid
+            .to_string();
+
+        let object_store = Arc::new(dataset.object_store().clone());
+        let scheduler = ScanScheduler::new(
+            object_store.clone(),
+            SchedulerConfig::max_bandwidth(&object_store),
+        );
+
+        let storage_uri = dataset
+            .indices_dir()
+            .child(uuid.as_str())
+            .child(INDEX_AUXILIARY_FILE_NAME);
+        let cache = LanceCache::no_cache();
+        let reader = FileReader::try_open(
+            scheduler
+                .open_file(&storage_uri, &CachedFileSize::unknown())
+                .await
+                .unwrap(),
+            None,
+            Arc::<DecoderPlugins>::default(),
+            &cache,
+            FileReaderOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert!(reader.schema().field("vector").is_none());
+    }
+
     async fn test_index_multivec(params: VectorIndexParams, nlist: usize, recall_requirement: f32) {
         // we introduce XTR for performance, which would reduce the recall a little bit
         let recall_requirement = recall_requirement * 0.9;

@@ -535,13 +535,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
 
         let code_column = quantizer.column();
 
+        let keep_residual_vector = Q::quantization_type() == QuantizationType::Rabit
+            && matches!(SubIndexType::try_from(S::name()), Ok(SubIndexType::Hnsw));
         let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
+            lance_index::vector::ivf::new_ivf_transformer_with_quantizer_and_options(
                 ivf.centroids.clone().unwrap(),
                 self.distance_type,
                 &self.column,
                 quantizer.into(),
                 None,
+                lance_index::vector::ivf::IvfTransformerOptions {
+                    keep_residual_vector,
+                },
             )?,
         );
 
@@ -796,6 +801,34 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                             }
 
                             if assign_batch.num_rows() > 0 {
+                                let keep_residual_vector = Q::quantization_type()
+                                    == QuantizationType::Rabit
+                                    && matches!(
+                                        SubIndexType::try_from(S::name()),
+                                        Ok(SubIndexType::Hnsw)
+                                    );
+                                if keep_residual_vector {
+                                    if let Some((vec_idx, vec_field)) =
+                                        assign_batch.schema().column_with_name(&column)
+                                    {
+                                        for batch in batches.iter_mut() {
+                                            if batch.column_by_name(&column).is_none()
+                                                && batch.num_rows() > 0
+                                            {
+                                                let nulls = arrow_array::new_null_array(
+                                                    vec_field.data_type(),
+                                                    batch.num_rows(),
+                                                );
+                                                *batch = batch.try_with_column_at(
+                                                    vec_idx,
+                                                    vec_field.clone(),
+                                                    nulls,
+                                                )?;
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Drop PART_ID column from assign_batch to match schema of existing batches
                                 let assign_batch = assign_batch.drop_column(PART_ID_COLUMN)?;
                                 batches.push(assign_batch);
@@ -967,6 +1000,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 location!(),
             ));
         };
+        let keep_residual_vector = Q::quantization_type() == QuantizationType::Rabit
+            && matches!(SubIndexType::try_from(S::name()), Ok(SubIndexType::Hnsw));
 
         // prepare the final writers
         let storage_path = self.index_dir.child(INDEX_AUXILIARY_FILE_NAME);
@@ -1011,7 +1046,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                 storage_ivf.add_partition(0);
             } else {
                 let batches = storage.to_batches()?.collect::<Vec<_>>();
-                let batch = arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+                let mut batch =
+                    arrow::compute::concat_batches(&batches[0].schema(), batches.iter())?;
+                if keep_residual_vector {
+                    batch = batch.drop_column(&self.column)?;
+                }
                 storage_writer.write_batch(&batch).await?;
                 storage_ivf.add_partition(batch.num_rows() as u32);
             }
@@ -1586,13 +1625,18 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             ));
         };
 
+        let keep_residual_vector = Q::quantization_type() == QuantizationType::Rabit
+            && matches!(SubIndexType::try_from(S::name()), Ok(SubIndexType::Hnsw));
         let transformer = Arc::new(
-            lance_index::vector::ivf::new_ivf_transformer_with_quantizer(
+            lance_index::vector::ivf::new_ivf_transformer_with_quantizer_and_options(
                 centroids.clone(),
                 self.distance_type,
                 vector_field.name().as_str(),
                 quantizer.into(),
                 None,
+                lance_index::vector::ivf::IvfTransformerOptions {
+                    keep_residual_vector,
+                },
             )?,
         );
 

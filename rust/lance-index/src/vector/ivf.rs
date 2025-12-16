@@ -58,6 +58,34 @@ pub fn new_ivf_transformer_with_quantizer(
     quantizer: Quantizer,
     range: Option<Range<u32>>,
 ) -> Result<IvfTransformer> {
+    new_ivf_transformer_with_quantizer_and_options(
+        centroids,
+        metric_type,
+        vector_column,
+        quantizer,
+        range,
+        IvfTransformerOptions::default(),
+    )
+}
+
+/// Options to control IVF transforms in build-time pipelines.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IvfTransformerOptions {
+    /// Keep the residual vector column after Rabit/RQ transform.
+    ///
+    /// This is intended for build-time algorithms that need random access to residual vectors
+    /// (e.g. HNSW construction). The column can be dropped before persisting the index.
+    pub keep_residual_vector: bool,
+}
+
+pub fn new_ivf_transformer_with_quantizer_and_options(
+    centroids: FixedSizeListArray,
+    metric_type: MetricType,
+    vector_column: &str,
+    quantizer: Quantizer,
+    range: Option<Range<u32>>,
+    options: IvfTransformerOptions,
+) -> Result<IvfTransformer> {
     match quantizer {
         Quantizer::Flat(_) | Quantizer::FlatBin(_) => Ok(IvfTransformer::new_flat(
             centroids,
@@ -85,6 +113,7 @@ pub fn new_ivf_transformer_with_quantizer(
             vector_column,
             rq,
             range,
+            options.keep_residual_vector,
         )),
     }
 }
@@ -284,6 +313,7 @@ impl IvfTransformer {
         vector_column: &str,
         rq: RabitQuantizer,
         range: Option<Range<u32>>,
+        keep_residual_vector: bool,
     ) -> Self {
         let mut transforms: Vec<Arc<dyn Transformer>> =
             vec![Arc::new(super::transform::Flatten::new(vector_column))];
@@ -317,12 +347,14 @@ impl IvfTransformer {
             vector_column,
         )));
 
-        transforms.push(Arc::new(RQTransformer::new(
-            rq,
-            distance_type,
-            centroids.clone(),
-            vector_column,
-        )));
+        let rq_transformer =
+            RQTransformer::new(rq, distance_type, centroids.clone(), vector_column);
+        let rq_transformer = if keep_residual_vector {
+            rq_transformer.keep_vector_column()
+        } else {
+            rq_transformer
+        };
+        transforms.push(Arc::new(rq_transformer));
 
         Self::new(centroids, distance_type, transforms)
     }
