@@ -550,7 +550,6 @@ impl VectorStore for RabitQuantizationStorage {
         )
     }
 
-    // TODO: implement this
     // This method is required for HNSW, we can't support HNSW_RABIT before this is implemented
     fn dist_calculator_from_id(&self, id: u32) -> Self::DistanceCalculator<'_> {
         let id = id as usize;
