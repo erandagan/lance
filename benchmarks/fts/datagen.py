@@ -96,24 +96,33 @@ def build_cum_weights(
     vocab_size: int,
     normal_mean: float,
     normal_stddev: float,
+    zipf_s: float,
 ) -> Optional[List[float]]:
     if distribution == "uniform":
         return None
-    if distribution != "normal":
-        raise ValueError(f"Unsupported distribution: {distribution}")
-    if not (0.0 <= normal_mean <= 1.0):
-        raise ValueError("normal_mean must be between 0 and 1")
-    if not (0.0 < normal_stddev <= 1.0):
-        raise ValueError("normal_stddev must be in (0, 1]")
+    if distribution == "normal":
+        if not (0.0 <= normal_mean <= 1.0):
+            raise ValueError("normal_mean must be between 0 and 1")
+        if not (0.0 < normal_stddev <= 1.0):
+            raise ValueError("normal_stddev must be in (0, 1]")
 
-    mu = normal_mean * (vocab_size - 1)
-    sigma = max(normal_stddev * vocab_size, 1e-6)
-    weights = [
-        math.exp(-0.5 * ((idx - mu) / sigma) ** 2) for idx in range(vocab_size)
-    ]
-    if not any(weight > 0 for weight in weights):
-        raise ValueError("Normal distribution produced zero weights")
-    return list(itertools.accumulate(weights))
+        mu = normal_mean * (vocab_size - 1)
+        sigma = max(normal_stddev * vocab_size, 1e-6)
+        weights = [
+            math.exp(-0.5 * ((idx - mu) / sigma) ** 2) for idx in range(vocab_size)
+        ]
+        if not any(weight > 0 for weight in weights):
+            raise ValueError("Normal distribution produced zero weights")
+        return list(itertools.accumulate(weights))
+    if distribution == "zipf":
+        if not (0.0 < zipf_s):
+            raise ValueError("zipf_s must be greater than 0")
+        # Zipf distribution: weight[i] = 1 / (i+1)^s
+        weights = [1.0 / ((idx + 1) ** zipf_s) for idx in range(vocab_size)]
+        if not any(weight > 0 for weight in weights):
+            raise ValueError("Zipf distribution produced zero weights")
+        return list(itertools.accumulate(weights))
+    raise ValueError(f"Unsupported distribution: {distribution}")
 
 
 def sample_words(
@@ -164,6 +173,12 @@ def write_batches(
         raise SystemExit(
             "pyarrow is required for this script. Install with 'pip install pyarrow'."
         ) from exc
+    try:
+        from tqdm import tqdm
+    except ImportError as exc:  # pragma: no cover - only used when tqdm missing
+        raise SystemExit(
+            "tqdm is required for this script. Install with 'pip install tqdm'."
+        ) from exc
 
     rng = random.Random(seed)
     db = lancedb.connect(db_uri)
@@ -174,45 +189,40 @@ def write_batches(
     next_id = start_id
     start_time = time.perf_counter()
 
-    while rows_written < total_rows:
-        batch_size = min(batch_rows, total_rows - rows_written)
-        docs = list(iter_docs(batch_size, words_per_doc, vocab, cum_weights, rng))
-        arrays = {"doc": pa.array(docs, type=pa.large_string())}
-        if with_id:
-            ids = range(next_id, next_id + batch_size)
-            arrays["id"] = pa.array(ids, type=pa.uint64())
-            next_id += batch_size
+    with tqdm(total=total_rows, unit="rows", desc="Writing batches") as pbar:
+        while rows_written < total_rows:
+            batch_size = min(batch_rows, total_rows - rows_written)
+            docs = list(iter_docs(batch_size, words_per_doc, vocab, cum_weights, rng))
+            arrays = {"doc": pa.array(docs, type=pa.large_string())}
+            if with_id:
+                ids = range(next_id, next_id + batch_size)
+                arrays["id"] = pa.array(ids, type=pa.uint64())
+                next_id += batch_size
 
-        batch = pa.table(arrays)
+            batch = pa.table(arrays)
 
-        if table is None:
-            if mode == "append":
-                try:
-                    table = db.open_table(table_name)
-                    table_exists = True
-                    table.add(batch)
-                except Exception:
-                    table = db.create_table(table_name, data=batch)
+            if table is None:
+                if mode == "append":
+                    try:
+                        table = db.open_table(table_name)
+                        table_exists = True
+                        table.add(batch)
+                    except Exception:
+                        table = db.create_table(table_name, data=batch)
+                else:
+                    table = db.create_table(table_name, data=batch, mode="overwrite")
             else:
-                table = db.create_table(table_name, data=batch, mode="overwrite")
-        else:
-            table.add(batch)
+                table.add(batch)
 
-        rows_written += batch_size
-        if log_every and rows_written % log_every == 0:
+            rows_written += batch_size
             elapsed = time.perf_counter() - start_time
             rate = rows_written / max(elapsed, 1e-6)
-            print(
-                f"wrote {rows_written:,} rows in {elapsed:.1f}s "
-                f"({rate:,.0f} rows/s)"
-            )
+            pbar.update(batch_size)
+            pbar.set_postfix({"rate": f"{rate:,.0f} rows/s"})
 
     elapsed = time.perf_counter() - start_time
     rate = rows_written / max(elapsed, 1e-6)
-    print(
-        f"done: wrote {rows_written:,} rows in {elapsed:.1f}s "
-        f"({rate:,.0f} rows/s)"
-    )
+    print(f"done: wrote {rows_written:,} rows in {elapsed:.1f}s ({rate:,.0f} rows/s)")
     if mode == "append" and with_id and table_exists and start_id == 0:
         print(
             "warning: appended with id column starting at 0; "
@@ -236,8 +246,8 @@ def main() -> None:
     parser.add_argument("--max-word-len", type=int, default=24)
     parser.add_argument(
         "--distribution",
-        choices=["normal", "uniform"],
-        default="normal",
+        choices=["normal", "uniform", "zipf"],
+        default="zipf",
         help="Distribution used to sample words",
     )
     parser.add_argument(
@@ -251,6 +261,12 @@ def main() -> None:
         type=float,
         default=0.15,
         help="Stddev for normal distribution as fraction of vocab (0-1]",
+    )
+    parser.add_argument(
+        "--zipf-s",
+        type=float,
+        default=1.0,
+        help="Zipf distribution parameter s (must be > 0)",
     )
     parser.add_argument("--mode", choices=["overwrite", "append"], default="overwrite")
     parser.add_argument("--with-id", action="store_true", default=False)
@@ -280,13 +296,16 @@ def main() -> None:
         f"mode: {args.mode}, distribution: {args.distribution}"
     )
     cum_weights = build_cum_weights(
-        args.distribution, len(vocab), args.normal_mean, args.normal_stddev
+        args.distribution, len(vocab), args.normal_mean, args.normal_stddev, args.zipf_s
     )
     if cum_weights is not None:
-        print(
-            f"normal mean: {args.normal_mean:.3f}, "
-            f"normal stddev: {args.normal_stddev:.3f}"
-        )
+        if args.distribution == "normal":
+            print(
+                f"normal mean: {args.normal_mean:.3f}, "
+                f"normal stddev: {args.normal_stddev:.3f}"
+            )
+        elif args.distribution == "zipf":
+            print(f"zipf s: {args.zipf_s:.3f}")
 
     write_batches(
         db_uri=args.db_uri,
