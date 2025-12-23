@@ -168,44 +168,88 @@ impl InvertedIndexBuilder {
         let with_position = self.params.with_position;
         let next_id = self.partitions.iter().map(|id| id + 1).max().unwrap_or(0);
         let id_alloc = Arc::new(AtomicU64::new(next_id));
-        let (sender, receiver) = async_channel::bounded(num_workers);
-        let mut index_tasks = Vec::with_capacity(num_workers);
+        let (batch_sender, batch_receiver) = async_channel::bounded(num_workers);
+        let (partition_sender, partition_receiver) = async_channel::bounded(num_workers);
+
+        let mut io_tasks = Vec::with_capacity(num_workers);
         for _ in 0..num_workers {
             let store = self.local_store.clone();
+            let partition_receiver: async_channel::Receiver<PartitionBatches> =
+                partition_receiver.clone();
+            let task = tokio::task::spawn(async move {
+                while let Ok(partition) = partition_receiver.recv().await {
+                    partition.write(store.as_ref()).await?;
+                }
+                Result::Ok(())
+            });
+            io_tasks.push(task);
+        }
+        drop(partition_receiver);
+
+        let mut index_tasks = Vec::with_capacity(num_workers);
+        for _ in 0..num_workers {
             let tokenizer = tokenizer.clone();
-            let receiver = receiver.clone();
+            let batch_receiver: async_channel::Receiver<RecordBatch> = batch_receiver.clone();
+            let partition_sender = partition_sender.clone();
             let id_alloc = id_alloc.clone();
             let fragment_mask = self.fragment_mask;
             let token_set_format = self.token_set_format;
-            let task = tokio::task::spawn(async move {
+            let task = spawn_cpu(move || {
                 let mut worker = IndexWorker::new(
-                    store,
                     tokenizer,
                     with_position,
                     id_alloc,
                     fragment_mask,
                     token_set_format,
-                )
-                .await?;
-                while let Ok(batch) = receiver.recv().await {
-                    worker.process_batch(batch).await?;
+                )?;
+                while let Ok(batch) = batch_receiver.recv_blocking() {
+                    if u32::MAX - (worker.num_docs() as u32) < batch.num_rows() as u32 {
+                        if let Some(partition) = worker.flush_into_batches()? {
+                            partition_sender
+                                .send_blocking(partition)
+                                .map_err(|_| Error::Internal {
+                                    message: "partition channel closed".to_owned(),
+                                    location: location!(),
+                                })?;
+                        }
+                    }
+                    for partition in worker.process_batch(batch)? {
+                        partition_sender
+                            .send_blocking(partition)
+                            .map_err(|_| Error::Internal {
+                                message: "partition channel closed".to_owned(),
+                                location: location!(),
+                            })?;
+                    }
                 }
-                let partitions = worker.finish().await?;
-                Result::Ok(partitions)
+                if let Some(partition) = worker.flush_into_batches()? {
+                    partition_sender
+                        .send_blocking(partition)
+                        .map_err(|_| Error::Internal {
+                            message: "partition channel closed".to_owned(),
+                            location: location!(),
+                        })?;
+                }
+                Result::Ok(worker.partitions)
             });
             index_tasks.push(task);
         }
 
-        let sender = Arc::new(sender);
+        drop(partition_sender);
 
         let mut stream = Box::pin(stream.then({
             |batch_result| {
-                let sender = sender.clone();
+                let batch_sender = batch_sender.clone();
                 async move {
-                    let sender = sender.clone();
                     let batch = batch_result?;
                     let num_rows = batch.num_rows();
-                    sender.send(batch).await.expect("failed to send batch");
+                    batch_sender
+                        .send(batch)
+                        .await
+                        .map_err(|_| Error::Internal {
+                            message: "batch channel closed".to_owned(),
+                            location: location!(),
+                        })?;
                     Result::Ok(num_rows)
                 }
             }
@@ -229,14 +273,16 @@ impl InvertedIndexBuilder {
         }
         // drop the sender to stop receivers
         drop(stream);
-        debug_assert_eq!(sender.sender_count(), 1);
-        drop(sender);
+        drop(batch_sender);
         log::info!("dispatching elapsed: {:?}", start.elapsed());
 
         // wait for the workers to finish
         let start = std::time::Instant::now();
         for index_task in index_tasks {
-            self.new_partitions.extend(index_task.await??);
+            self.new_partitions.extend(index_task.await?);
+        }
+        for io_task in io_tasks {
+            io_task.await??;
         }
         log::info!("wait workers indexing elapsed: {:?}", start.elapsed());
         Ok(())
@@ -427,6 +473,49 @@ impl InnerBuilder {
         Ok(())
     }
 
+    fn build_posting_list_batches(&mut self, docs: Arc<DocSet>) -> Result<Vec<RecordBatch>> {
+        let posting_lists = std::mem::take(&mut self.posting_lists);
+        let schema = inverted_list_schema(self.with_position);
+        let mut buffer = Vec::new();
+        let mut size_sum = 0;
+        let mut batches_out = Vec::new();
+        for posting_list in posting_lists {
+            let block_max_scores = docs.calculate_block_max_scores(
+                posting_list.doc_ids.iter(),
+                posting_list.frequencies.iter(),
+            );
+            let batch = posting_list.to_batch(block_max_scores)?;
+            size_sum += batch.get_array_memory_size();
+            buffer.push(batch);
+            if size_sum >= *LANCE_FTS_FLUSH_SIZE << 20 {
+                let batch = concat_batches(&schema, buffer.iter())?;
+                buffer.clear();
+                size_sum = 0;
+                batches_out.push(batch);
+            }
+        }
+        if !buffer.is_empty() {
+            let batch = concat_batches(&schema, buffer.iter())?;
+            batches_out.push(batch);
+        }
+        Ok(batches_out)
+    }
+
+    fn build_partition_batches(&mut self) -> Result<PartitionBatches> {
+        let docs = Arc::new(std::mem::take(&mut self.docs));
+        let posting_batches = self.build_posting_list_batches(docs.clone())?;
+        let tokens = std::mem::take(&mut self.tokens);
+        let tokens_batch = tokens.to_batch(self.token_set_format)?;
+        let docs_batch = docs.to_batch()?;
+        Ok(PartitionBatches {
+            id: self.id,
+            with_position: self.with_position,
+            posting_batches,
+            tokens_batch,
+            docs_batch,
+        })
+    }
+
     #[instrument(level = "debug", skip_all)]
     async fn write_posting_lists(
         &mut self,
@@ -520,8 +609,43 @@ impl InnerBuilder {
     }
 }
 
+struct PartitionBatches {
+    id: u64,
+    with_position: bool,
+    posting_batches: Vec<RecordBatch>,
+    tokens_batch: RecordBatch,
+    docs_batch: RecordBatch,
+}
+
+impl PartitionBatches {
+    async fn write(self, store: &dyn IndexStore) -> Result<()> {
+        let mut posting_writer = store
+            .new_index_file(
+                &posting_file_path(self.id),
+                inverted_list_schema(self.with_position),
+            )
+            .await?;
+        for batch in self.posting_batches {
+            posting_writer.write_record_batch(batch).await?;
+        }
+        posting_writer.finish().await?;
+
+        let mut token_writer = store
+            .new_index_file(&token_file_path(self.id), self.tokens_batch.schema())
+            .await?;
+        token_writer.write_record_batch(self.tokens_batch).await?;
+        token_writer.finish().await?;
+
+        let mut doc_writer = store
+            .new_index_file(&doc_file_path(self.id), self.docs_batch.schema())
+            .await?;
+        doc_writer.write_record_batch(self.docs_batch).await?;
+        doc_writer.finish().await?;
+        Ok(())
+    }
+}
+
 struct IndexWorker {
-    store: Arc<dyn IndexStore>,
     tokenizer: Box<dyn LanceTokenizer>,
     id_alloc: Arc<AtomicU64>,
     builder: InnerBuilder,
@@ -537,8 +661,7 @@ struct IndexWorker {
 }
 
 impl IndexWorker {
-    async fn new(
-        store: Arc<dyn IndexStore>,
+    fn new(
         tokenizer: Box<dyn LanceTokenizer>,
         with_position: bool,
         id_alloc: Arc<AtomicU64>,
@@ -557,7 +680,6 @@ impl IndexWorker {
         let estimated_size = docs_size + tokens_size;
 
         Ok(Self {
-            store,
             tokenizer,
             builder,
             partitions: Vec::new(),
@@ -577,7 +699,41 @@ impl IndexWorker {
         self.schema.column_with_name(POSITION_COL).is_some()
     }
 
-    async fn process_batch(&mut self, batch: RecordBatch) -> Result<()> {
+    fn num_docs(&self) -> usize {
+        self.builder.docs.len()
+    }
+
+    fn next_builder(&self) -> InnerBuilder {
+        InnerBuilder::new(
+            self.id_alloc
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                | self.fragment_mask.unwrap_or(0),
+            self.has_position(),
+            self.token_set_format,
+        )
+    }
+
+    fn flush_into_batches(&mut self) -> Result<Option<PartitionBatches>> {
+        if self.builder.tokens.is_empty() {
+            return Ok(None);
+        }
+
+        log::info!(
+            "flushing posting lists, estimated size: {} MiB",
+            self.estimated_size / (1024 * 1024)
+        );
+        let next_builder = self.next_builder();
+        let mut builder = std::mem::replace(&mut self.builder, next_builder);
+        let batches = builder.build_partition_batches()?;
+        self.partitions.push(batches.id);
+        self.docs_size = self.builder.docs.size();
+        self.tokens_size = self.builder.tokens.estimated_size();
+        self.estimated_size = self.docs_size + self.tokens_size;
+        Ok(Some(batches))
+    }
+
+    fn process_batch(&mut self, batch: RecordBatch) -> Result<Vec<PartitionBatches>> {
+        let mut flushed = Vec::new();
         let doc_col = batch.column(0);
         let doc_iter = iter_str_array(doc_col);
         let row_id_col = batch[ROW_ID].as_primitive::<datatypes::UInt64Type>();
@@ -625,50 +781,14 @@ impl IndexWorker {
                 self.estimated_size += new_size - old_size;
             }
 
-            if self.builder.docs.len() as u32 == u32::MAX
-                || self.estimated_size >= *LANCE_FTS_PARTITION_SIZE << 20
-            {
-                self.flush().await?;
+            if self.estimated_size >= *LANCE_FTS_PARTITION_SIZE << 20 {
+                if let Some(batches) = self.flush_into_batches()? {
+                    flushed.push(batches);
+                }
             }
         }
 
-        Ok(())
-    }
-
-    #[instrument(level = "debug", skip_all)]
-    async fn flush(&mut self) -> Result<()> {
-        if self.builder.tokens.is_empty() {
-            return Ok(());
-        }
-
-        log::info!(
-            "flushing posting lists, estimated size: {} MiB",
-            self.estimated_size / (1024 * 1024)
-        );
-        let with_position = self.has_position();
-        let mut builder = std::mem::replace(
-            &mut self.builder,
-            InnerBuilder::new(
-                self.id_alloc
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    | self.fragment_mask.unwrap_or(0),
-                with_position,
-                self.token_set_format,
-            ),
-        );
-        builder.write(self.store.as_ref()).await?;
-        self.partitions.push(builder.id());
-        self.docs_size = self.builder.docs.size();
-        self.tokens_size = self.builder.tokens.estimated_size();
-        self.estimated_size = self.docs_size + self.tokens_size;
-        Ok(())
-    }
-
-    async fn finish(mut self) -> Result<Vec<u64>> {
-        if !self.builder.tokens.is_empty() {
-            self.flush().await?;
-        }
-        Ok(self.partitions)
+        Ok(flushed)
     }
 }
 
