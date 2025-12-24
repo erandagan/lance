@@ -1756,20 +1756,12 @@ impl DecompressedBlock {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct DecompressedBlockCache {
-    slots: Vec<Mutex<Weak<DecompressedBlock>>>,
+    blocks: Mutex<HashMap<usize, Weak<DecompressedBlock>>>,
 }
 
 impl DecompressedBlockCache {
-    fn new(num_blocks: usize) -> Self {
-        let mut slots = Vec::with_capacity(num_blocks);
-        for _ in 0..num_blocks {
-            slots.push(Mutex::new(Weak::new()));
-        }
-        Self { slots }
-    }
-
     fn get_or_decompress(
         &self,
         block_idx: usize,
@@ -1777,17 +1769,29 @@ impl DecompressedBlockCache {
         num_blocks: usize,
         length: u32,
     ) -> Arc<DecompressedBlock> {
-        let mut slot = self.slots[block_idx]
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
-        if let Some(block) = slot.upgrade() {
+        if let Some(block) = self.try_get(block_idx) {
             return block;
         }
 
         let decompressed =
             Arc::new(DecompressedBlock::decompress(block, block_idx, num_blocks, length));
-        *slot = Arc::downgrade(&decompressed);
+
+        let mut blocks = self.blocks.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(existing) = blocks.get(&block_idx).and_then(|weak| weak.upgrade()) {
+            return existing;
+        }
+        blocks.insert(block_idx, Arc::downgrade(&decompressed));
         decompressed
+    }
+
+    fn try_get(&self, block_idx: usize) -> Option<Arc<DecompressedBlock>> {
+        let mut blocks = self.blocks.lock().unwrap_or_else(|err| err.into_inner());
+        let weak = blocks.get(&block_idx)?;
+        if let Some(block) = weak.upgrade() {
+            return Some(block);
+        }
+        blocks.remove(&block_idx);
+        None
     }
 }
 
@@ -1829,7 +1833,7 @@ impl CompressedPostingList {
         length: u32,
         positions: Option<ListArray>,
     ) -> Self {
-        let decompressed = Arc::new(DecompressedBlockCache::new(blocks.len()));
+        let decompressed = Arc::new(DecompressedBlockCache::default());
         Self {
             max_score,
             length,
@@ -1850,7 +1854,7 @@ impl CompressedPostingList {
             .column_by_name(POSITION_COL)
             .map(|col| col.as_list::<i32>().value(0).as_list::<i32>().clone());
 
-        let decompressed = Arc::new(DecompressedBlockCache::new(blocks.len()));
+        let decompressed = Arc::new(DecompressedBlockCache::default());
         Self {
             max_score,
             length,
