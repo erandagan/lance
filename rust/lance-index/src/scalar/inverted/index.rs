@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt::{Debug, Display};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, LazyLock, Weak};
 use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
@@ -46,6 +46,7 @@ use roaring::RoaringBitmap;
 use snafu::location;
 use tokio::task::spawn_blocking;
 use tracing::{info, instrument};
+use moka::sync::Cache;
 
 use super::{
     builder::{
@@ -1756,9 +1757,17 @@ impl DecompressedBlock {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DecompressedBlockCache {
-    blocks: Mutex<HashMap<usize, Weak<DecompressedBlock>>>,
+    blocks: Cache<usize, Weak<DecompressedBlock>>,
+}
+
+impl Default for DecompressedBlockCache {
+    fn default() -> Self {
+        Self {
+            blocks: Cache::builder().build(),
+        }
+    }
 }
 
 impl DecompressedBlockCache {
@@ -1776,21 +1785,20 @@ impl DecompressedBlockCache {
         let decompressed =
             Arc::new(DecompressedBlock::decompress(block, block_idx, num_blocks, length));
 
-        let mut blocks = self.blocks.lock().unwrap_or_else(|err| err.into_inner());
-        if let Some(existing) = blocks.get(&block_idx).and_then(|weak| weak.upgrade()) {
+        if let Some(existing) = self.try_get(block_idx) {
             return existing;
         }
-        blocks.insert(block_idx, Arc::downgrade(&decompressed));
+        self.blocks
+            .insert(block_idx, Arc::downgrade(&decompressed));
         decompressed
     }
 
     fn try_get(&self, block_idx: usize) -> Option<Arc<DecompressedBlock>> {
-        let mut blocks = self.blocks.lock().unwrap_or_else(|err| err.into_inner());
-        let weak = blocks.get(&block_idx)?;
+        let weak = self.blocks.get(&block_idx)?;
         if let Some(block) = weak.upgrade() {
             return Some(block);
         }
-        blocks.remove(&block_idx);
+        self.blocks.invalidate(&block_idx);
         None
     }
 }
