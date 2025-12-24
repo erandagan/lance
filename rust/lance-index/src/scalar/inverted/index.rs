@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use std::fmt::{Debug, Display};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::{
     cmp::{min, Reverse},
     collections::BinaryHeap,
@@ -44,7 +44,6 @@ use lance_core::{
 use lance_core::{Error, Result, ROW_ID, ROW_ID_FIELD};
 use roaring::RoaringBitmap;
 use snafu::location;
-use std::sync::LazyLock;
 use tokio::task::spawn_blocking;
 use tracing::{info, instrument};
 
@@ -63,7 +62,7 @@ use super::{
     iter::CompressedPostingListIterator,
 };
 use super::{
-    encoding::compress_positions,
+    encoding::{compress_positions, decompress_posting_block, decompress_posting_remainder},
     iter::{PostingListIterator, TokenIterator, TokenSource},
 };
 use super::{wand::*, InvertedIndexBuilder, InvertedIndexParams};
@@ -1727,7 +1726,72 @@ impl PlainPostingList {
     }
 }
 
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug)]
+pub(super) struct DecompressedBlock {
+    pub(super) doc_ids: Vec<u32>,
+    pub(super) freqs: Vec<u32>,
+}
+
+impl DecompressedBlock {
+    fn decompress(block: &[u8], block_idx: usize, num_blocks: usize, length: u32) -> Self {
+        let remainder = length as usize % BLOCK_SIZE;
+        let is_last_block = block_idx + 1 == num_blocks;
+        let capacity = if is_last_block && remainder != 0 {
+            remainder
+        } else {
+            BLOCK_SIZE
+        };
+
+        let mut doc_ids = Vec::with_capacity(capacity);
+        let mut freqs = Vec::with_capacity(capacity);
+
+        if is_last_block && remainder != 0 {
+            decompress_posting_remainder(block, remainder, &mut doc_ids, &mut freqs);
+        } else {
+            let mut buffer = [0u32; BLOCK_SIZE];
+            decompress_posting_block(block, &mut buffer, &mut doc_ids, &mut freqs);
+        }
+
+        Self { doc_ids, freqs }
+    }
+}
+
+#[derive(Debug)]
+struct DecompressedBlockCache {
+    slots: Vec<Mutex<Weak<DecompressedBlock>>>,
+}
+
+impl DecompressedBlockCache {
+    fn new(num_blocks: usize) -> Self {
+        let mut slots = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            slots.push(Mutex::new(Weak::new()));
+        }
+        Self { slots }
+    }
+
+    fn get_or_decompress(
+        &self,
+        block_idx: usize,
+        block: &[u8],
+        num_blocks: usize,
+        length: u32,
+    ) -> Arc<DecompressedBlock> {
+        let mut slot = self.slots[block_idx]
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(block) = slot.upgrade() {
+            return block;
+        }
+
+        let decompressed =
+            Arc::new(DecompressedBlock::decompress(block, block_idx, num_blocks, length));
+        *slot = Arc::downgrade(&decompressed);
+        decompressed
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CompressedPostingList {
     pub max_score: f32,
     pub length: u32,
@@ -1735,6 +1799,7 @@ pub struct CompressedPostingList {
     // that contains `BLOCK_SIZE` doc ids and then `BLOCK_SIZE` frequencies
     pub blocks: LargeBinaryArray,
     pub positions: Option<ListArray>,
+    decompressed: Arc<DecompressedBlockCache>,
 }
 
 impl DeepSizeOf for CompressedPostingList {
@@ -1748,6 +1813,15 @@ impl DeepSizeOf for CompressedPostingList {
     }
 }
 
+impl PartialEq for CompressedPostingList {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_score == other.max_score
+            && self.length == other.length
+            && self.blocks == other.blocks
+            && self.positions == other.positions
+    }
+}
+
 impl CompressedPostingList {
     pub fn new(
         blocks: LargeBinaryArray,
@@ -1755,11 +1829,13 @@ impl CompressedPostingList {
         length: u32,
         positions: Option<ListArray>,
     ) -> Self {
+        let decompressed = Arc::new(DecompressedBlockCache::new(blocks.len()));
         Self {
             max_score,
             length,
             blocks,
             positions,
+            decompressed,
         }
     }
 
@@ -1774,11 +1850,13 @@ impl CompressedPostingList {
             .column_by_name(POSITION_COL)
             .map(|col| col.as_list::<i32>().value(0).as_list::<i32>().clone());
 
+        let decompressed = Arc::new(DecompressedBlockCache::new(blocks.len()));
         Self {
             max_score,
             length,
             blocks,
             positions,
+            decompressed,
         }
     }
 
@@ -1788,6 +1866,12 @@ impl CompressedPostingList {
             self.blocks.clone(),
             self.positions.clone(),
         )
+    }
+
+    pub(super) fn decompressed_block(&self, block_idx: usize) -> Arc<DecompressedBlock> {
+        let block = self.blocks.value(block_idx);
+        self.decompressed
+            .get_or_decompress(block_idx, block, self.blocks.len(), self.length)
     }
 
     pub fn block_max_score(&self, block_idx: usize) -> f32 {

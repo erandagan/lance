@@ -19,7 +19,8 @@ use crate::metrics::MetricsCollector;
 
 use super::{
     builder::ScoredDoc,
-    encoding::{decompress_positions, decompress_posting_block, decompress_posting_remainder},
+    encoding::decompress_positions,
+    index::DecompressedBlock,
     query::FtsSearchParams,
     scorer::Scorer,
     DocSet, PostingList, RawDocInfo,
@@ -57,33 +58,15 @@ pub struct PostingIterator {
 #[derive(Clone)]
 struct CompressedState {
     block_idx: usize,
-    doc_ids: Vec<u32>,
-    freqs: Vec<u32>,
-    buffer: Box<[u32; BLOCK_SIZE]>,
+    block: Option<Arc<DecompressedBlock>>,
 }
 
 impl CompressedState {
     fn new() -> Self {
         Self {
             block_idx: 0,
-            doc_ids: Vec::with_capacity(BLOCK_SIZE),
-            freqs: Vec::with_capacity(BLOCK_SIZE),
-            buffer: Box::new([0; BLOCK_SIZE]),
+            block: None,
         }
-    }
-
-    #[inline]
-    fn decompress(&mut self, block: &[u8], block_idx: usize, num_blocks: usize, length: u32) {
-        self.doc_ids.clear();
-        self.freqs.clear();
-
-        let remainder = length as usize % BLOCK_SIZE;
-        if block_idx + 1 == num_blocks && remainder != 0 {
-            decompress_posting_remainder(block, remainder, &mut self.doc_ids, &mut self.freqs);
-        } else {
-            decompress_posting_block(block, &mut self.buffer, &mut self.doc_ids, &mut self.freqs);
-        }
-        self.block_idx = block_idx;
     }
 }
 
@@ -193,14 +176,15 @@ impl PostingIterator {
                 };
                 let block_idx = self.index / BLOCK_SIZE;
                 let block_offset = self.index % BLOCK_SIZE;
-                if compressed.block_idx != block_idx || compressed.doc_ids.is_empty() {
-                    let block = list.blocks.value(block_idx);
-                    compressed.decompress(block, block_idx, list.blocks.len(), list.length);
+                if compressed.block_idx != block_idx || compressed.block.is_none() {
+                    compressed.block_idx = block_idx;
+                    compressed.block = Some(list.decompressed_block(block_idx));
                 }
 
                 // Read from the decompressed block
-                let doc_id = compressed.doc_ids[block_offset];
-                let frequency = compressed.freqs[block_offset];
+                let block = compressed.block.as_ref().expect("decompressed block exists");
+                let doc_id = block.doc_ids[block_offset];
+                let frequency = block.freqs[block_offset];
                 let doc = DocInfo::Raw(RawDocInfo { doc_id, frequency });
                 Some(doc)
             }
@@ -935,6 +919,29 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.len(), 0); // Should not panic
+    }
+
+    #[test]
+    fn test_shared_decompressed_blocks() {
+        let posting = generate_posting_list(
+            Vec::from_iter(0..=BLOCK_SIZE as u32 + 1),
+            1.0,
+            None,
+            true,
+        );
+        let PostingList::Compressed(list) = posting else {
+            panic!("expected a compressed posting list");
+        };
+        let list_clone = list.clone();
+
+        let block_a = list.decompressed_block(0);
+        let block_b = list_clone.decompressed_block(0);
+        assert!(Arc::ptr_eq(&block_a, &block_b));
+
+        let weak = Arc::downgrade(&block_a);
+        drop(block_a);
+        drop(block_b);
+        assert!(weak.upgrade().is_none());
     }
 
     #[test]
