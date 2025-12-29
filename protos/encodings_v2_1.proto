@@ -477,10 +477,11 @@ message ByteStreamSplit {
 // original bit patterns).
 //
 // The input is a fixed-width data block of either 32-bit (f32) or 64-bit (f64).
-// The output is described by this message and is encoded into three buffers:
-//  - Buffer 0: per-chunk header + bitpacked deltas of encoded integers
-//  - Buffer 1: exception positions (u16 little-endian)
-//  - Buffer 2: exception values (raw IEEE754 bits, u32/u64 little-endian)
+// The output is described by this message and is encoded into four buffers:
+//  - Buffer 0: bitpacked deltas of encoded integers
+//  - Buffer 1: per-chunk header (min + bit width)
+//  - Buffer 2: exception positions (u16 little-endian)
+//  - Buffer 3: exception values (raw IEEE754 bits, u32/u64 little-endian)
 message Alp {
   // 32 for f32 and 64 for f64
   uint32 bits_per_value = 1;
