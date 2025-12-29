@@ -268,7 +268,7 @@ impl InvertedIndex {
                 let metrics = metrics.clone();
                 async move {
                     let postings = part
-                        .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.as_ref())
+                        .load_posting_lists(tokens.as_ref(), params.as_ref(), metrics.clone())
                         .await?;
                     if postings.is_empty() {
                         return Ok(PartitionCandidates::empty());
@@ -359,8 +359,12 @@ impl InvertedIndex {
             let index_cache_clone = index_cache.clone();
             async move {
                 let invert_list_reader = store.open_index_file(INVERT_LIST_FILE).await?;
-                let invert_list =
-                    PostingListReader::try_new(invert_list_reader, &index_cache_clone).await?;
+                let invert_list = PostingListReader::try_new(
+                    invert_list_reader,
+                    &index_cache_clone,
+                    store.io_parallelism(),
+                )
+                .await?;
                 Result::Ok(Arc::new(invert_list))
             }
         });
@@ -699,7 +703,9 @@ impl InvertedPartition {
         let token_file = store.open_index_file(&token_file_path(id)).await?;
         let tokens = TokenSet::load(token_file, token_set_format).await?;
         let invert_list_file = store.open_index_file(&posting_file_path(id)).await?;
-        let inverted_list = PostingListReader::try_new(invert_list_file, index_cache).await?;
+        let inverted_list =
+            PostingListReader::try_new(invert_list_file, index_cache, store.io_parallelism())
+                .await?;
         let docs_file = store.open_index_file(&doc_file_path(id)).await?;
         let docs = DocSet::load(docs_file, false, frag_reuse_index).await?;
 
@@ -762,7 +768,7 @@ impl InvertedPartition {
         &self,
         tokens: &Tokens,
         params: &FtsSearchParams,
-        metrics: &dyn MetricsCollector,
+        metrics: Arc<dyn MetricsCollector>,
     ) -> Result<Vec<PostingIterator>> {
         let is_fuzzy = matches!(params.fuzziness, Some(n) if n != 0);
         let is_phrase_query = params.phrase_slop.is_some();
@@ -789,22 +795,50 @@ impl InvertedPartition {
             token_ids.dedup_by_key(|(token_id, _)| *token_id);
         }
 
+        let prefetched = if !self.is_legacy() {
+            let mut requests = Vec::with_capacity(token_ids.len());
+            for (token_id, _) in &token_ids {
+                if let Some(request) = self.inverted_list.block_request(*token_id, 0)? {
+                    requests.push(request);
+                }
+            }
+            self.inverted_list
+                .prefetch_blocks(&requests, metrics.as_ref())
+                .await?
+        } else {
+            HashMap::new()
+        };
+        let prefetched = Arc::new(prefetched);
+
         let num_docs = self.docs.len();
         stream::iter(token_ids)
             .enumerate()
-            .map(|(position, (token_id, token))| async move {
-                let posting = self
-                    .inverted_list
-                    .posting_list(token_id, is_phrase_query, metrics)
-                    .await?;
+            .map(|(position, (token_id, token))| {
+                let metrics = metrics.clone();
+                let prefetched = prefetched.clone();
+                async move {
+                    let posting = self
+                        .inverted_list
+                        .posting_list(token_id, is_phrase_query, metrics.as_ref())
+                        .await?;
 
-                Result::Ok(PostingIterator::new(
-                    token,
-                    token_id,
-                    position as u32,
-                    posting,
-                    num_docs,
-                ))
+                    let mut posting = PostingIterator::new(
+                        token,
+                        token_id,
+                        position as u32,
+                        posting,
+                        num_docs,
+                        metrics.clone(),
+                    );
+                    let first_block = prefetched
+                        .get(&BlockRequest {
+                            token_id,
+                            block_idx: 0,
+                        })
+                        .cloned();
+                    posting.initialize(first_block)?;
+                    Result::Ok(posting)
+                }
             })
             .buffered(self.store.io_parallelism())
             .try_collect::<Vec<_>>()
@@ -1205,6 +1239,7 @@ pub struct PostingListReader {
     has_position: bool,
 
     index_cache: WeakLanceCache,
+    block_loader: Arc<PostingBlockLoader>,
 }
 
 impl std::fmt::Debug for PostingListReader {
@@ -1228,6 +1263,7 @@ impl PostingListReader {
     pub(crate) async fn try_new(
         reader: Arc<dyn IndexReader>,
         index_cache: &LanceCache,
+        io_parallelism: usize,
     ) -> Result<Self> {
         let has_position = reader.schema().field(POSITION_COL).is_some();
         let (offsets, max_scores, lengths) = if reader.schema().field(POSTING_COL).is_none() {
@@ -1248,6 +1284,12 @@ impl PostingListReader {
             (None, Some(max_scores), Some(lengths))
         };
 
+        let block_loader = Arc::new(PostingBlockLoader::new(
+            reader.clone(),
+            index_cache,
+            io_parallelism,
+        ));
+
         Ok(Self {
             reader,
             offsets,
@@ -1255,6 +1297,7 @@ impl PostingListReader {
             lengths,
             has_position,
             index_cache: WeakLanceCache::from(index_cache),
+            block_loader,
         })
     }
 
@@ -1377,7 +1420,6 @@ impl PostingListReader {
                 .as_ref()
                 .clone()
         } else {
-            let blocks = self.posting_blocks(token_id, metrics).await?;
             let max_scores = self.max_scores.as_ref().ok_or(Error::Internal {
                 message: "compressed posting list missing max scores".to_string(),
                 location: location!(),
@@ -1394,8 +1436,13 @@ impl PostingListReader {
                 message: "token id out of bounds for lengths".to_string(),
                 location: location!(),
             })?;
+            let num_blocks = (length as usize).div_ceil(BLOCK_SIZE);
             PostingList::Compressed(CompressedPostingList::new(
-                PostingBlocks::Cached(blocks),
+                PostingBlocks::Lazy(LazyPostingBlocks::new(
+                    token_id,
+                    num_blocks,
+                    self.block_loader.clone(),
+                )),
                 max_score,
                 length,
                 None,
@@ -1411,11 +1458,10 @@ impl PostingListReader {
         Ok(posting)
     }
 
-    async fn posting_blocks(
-        &self,
-        token_id: u32,
-        metrics: &dyn MetricsCollector,
-    ) -> Result<Vec<Arc<Vec<u8>>>> {
+    fn block_request(&self, token_id: u32, block_idx: usize) -> Result<Option<BlockRequest>> {
+        if self.offsets.is_some() {
+            return Ok(None);
+        }
         let lengths = self.lengths.as_ref().ok_or(Error::Internal {
             message: "compressed posting list missing lengths".to_string(),
             location: location!(),
@@ -1425,60 +1471,24 @@ impl PostingListReader {
             location: location!(),
         })?;
         let num_blocks = (length as usize).div_ceil(BLOCK_SIZE);
-        if num_blocks == 0 {
-            return Ok(Vec::new());
+        if block_idx >= num_blocks || num_blocks == 0 {
+            return Ok(None);
         }
+        Ok(Some(BlockRequest {
+            token_id,
+            block_idx,
+        }))
+    }
 
-        let mut blocks: Vec<Option<Arc<Vec<u8>>>> = vec![None; num_blocks];
-        let mut missing = Vec::new();
-        for (block_idx, slot) in blocks.iter_mut().enumerate() {
-            let cache_key = PostingBlockKey {
-                token_id,
-                block_idx: block_idx as u32,
-            };
-            if let Some(block) = self.index_cache.get_with_key(&cache_key).await {
-                *slot = Some(block);
-            } else {
-                missing.push(block_idx);
-            }
+    async fn prefetch_blocks(
+        &self,
+        requests: &[BlockRequest],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<HashMap<BlockRequest, Arc<Vec<u8>>>> {
+        if requests.is_empty() || self.offsets.is_some() {
+            return Ok(HashMap::new());
         }
-
-        if !missing.is_empty() {
-            metrics.record_part_load();
-            info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
-            let batch = self.posting_batch(token_id, false).await?;
-            let block_list = batch[POSTING_COL].as_list::<i32>();
-            let block_values = block_list.value(0);
-            let block_array = block_values.as_binary::<i64>();
-            debug_assert_eq!(
-                block_array.len(),
-                num_blocks,
-                "token_id: {}, num_blocks: {}, blocks in batch: {}",
-                token_id,
-                num_blocks,
-                block_array.len()
-            );
-
-            for block_idx in missing {
-                let block = Arc::new(block_array.value(block_idx).to_vec());
-                blocks[block_idx] = Some(block.clone());
-                let _ = self
-                    .index_cache
-                    .insert_with_key(
-                        &PostingBlockKey {
-                            token_id,
-                            block_idx: block_idx as u32,
-                        },
-                        block,
-                    )
-                    .await;
-            }
-        }
-
-        Ok(blocks
-            .into_iter()
-            .map(|block| block.expect("posting block should be loaded from cache or storage"))
-            .collect())
+        self.block_loader.load_blocks(requests, metrics).await
     }
 
     pub(crate) fn posting_list_from_batch(
@@ -1663,6 +1673,257 @@ impl CacheKey for PostingBlockKey {
 
     fn key(&self) -> std::borrow::Cow<'_, str> {
         format!("postings-{}-block-{}", self.token_id, self.block_idx).into()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct BlockRequest {
+    pub token_id: u32,
+    pub block_idx: usize,
+}
+
+struct PostingBlockLoader {
+    reader: Arc<dyn IndexReader>,
+    index_cache: WeakLanceCache,
+    io_parallelism: usize,
+    runtime: tokio::runtime::Handle,
+}
+
+impl std::fmt::Debug for PostingBlockLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostingBlockLoader")
+            .field("io_parallelism", &self.io_parallelism)
+            .finish()
+    }
+}
+
+impl PostingBlockLoader {
+    fn new(reader: Arc<dyn IndexReader>, index_cache: &LanceCache, io_parallelism: usize) -> Self {
+        Self {
+            reader,
+            index_cache: WeakLanceCache::from(index_cache),
+            io_parallelism: io_parallelism.max(1),
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    async fn load_blocks(
+        &self,
+        requests: &[BlockRequest],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<HashMap<BlockRequest, Arc<Vec<u8>>>> {
+        if requests.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut results = HashMap::new();
+        let mut missing: HashMap<u32, Vec<usize>> = HashMap::new();
+
+        for request in requests {
+            let cache_key = PostingBlockKey {
+                token_id: request.token_id,
+                block_idx: request.block_idx as u32,
+            };
+            if let Some(block) = self.index_cache.get_with_key(&cache_key).await {
+                results.insert(request.clone(), block);
+            } else {
+                missing
+                    .entry(request.token_id)
+                    .or_default()
+                    .push(request.block_idx);
+            }
+        }
+
+        if missing.is_empty() {
+            return Ok(results);
+        }
+
+        let reader = self.reader.clone();
+        let index_cache = self.index_cache.clone();
+        let io_parallelism = self.io_parallelism;
+        let fetched = stream::iter(missing.into_iter())
+            .map(|(token_id, mut block_indices)| {
+                let reader = reader.clone();
+                let index_cache = index_cache.clone();
+                async move {
+                    block_indices.sort_unstable();
+                    block_indices.dedup();
+                    metrics.record_part_load();
+                    info!(target: TRACE_IO_EVENTS, r#type=IO_TYPE_LOAD_SCALAR_PART, index_type="inverted", part_id=token_id);
+                    let batch = reader
+                        .read_range(token_id as usize..token_id as usize + 1, Some(&[POSTING_COL]))
+                        .await?;
+                    let block_list = batch[POSTING_COL].as_list::<i32>();
+                    let block_values = block_list.value(0);
+                    let block_array = block_values.as_binary::<i64>();
+                    let num_blocks = block_array.len();
+                    let mut loaded = Vec::with_capacity(block_indices.len());
+                    for block_idx in block_indices {
+                        if block_idx >= num_blocks {
+                            return Err(Error::Internal {
+                                message: format!(
+                                    "block index {} out of bounds for token {}",
+                                    block_idx, token_id
+                                ),
+                                location: location!(),
+                            });
+                        }
+                        let block = Arc::new(block_array.value(block_idx).to_vec());
+                        let cache_key = PostingBlockKey {
+                            token_id,
+                            block_idx: block_idx as u32,
+                        };
+                        let _ = index_cache.insert_with_key(&cache_key, block.clone()).await;
+                        loaded.push((BlockRequest { token_id, block_idx }, block));
+                    }
+                    Result::Ok(loaded)
+                }
+            })
+            .buffered(io_parallelism)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        for loaded in fetched {
+            for (request, block) in loaded {
+                results.insert(request, block);
+            }
+        }
+
+        Ok(results)
+    }
+
+    fn load_blocks_blocking(
+        &self,
+        requests: &[BlockRequest],
+        metrics: &dyn MetricsCollector,
+    ) -> Result<HashMap<BlockRequest, Arc<Vec<u8>>>> {
+        self.runtime.block_on(self.load_blocks(requests, metrics))
+    }
+}
+
+#[derive(Debug)]
+pub struct LazyPostingBlocks {
+    token_id: u32,
+    num_blocks: usize,
+    loader: Arc<PostingBlockLoader>,
+    blocks: std::sync::Mutex<Vec<Option<Arc<Vec<u8>>>>>,
+}
+
+impl LazyPostingBlocks {
+    fn new(token_id: u32, num_blocks: usize, loader: Arc<PostingBlockLoader>) -> Self {
+        Self {
+            token_id,
+            num_blocks,
+            loader,
+            blocks: std::sync::Mutex::new(vec![None; num_blocks]),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.num_blocks
+    }
+
+    fn loaded_size(&self) -> Result<usize> {
+        let blocks = self.blocks.lock().map_err(|_| Error::Internal {
+            message: "posting block mutex poisoned".to_string(),
+            location: location!(),
+        })?;
+        Ok(blocks
+            .iter()
+            .filter_map(|block| block.as_ref().map(|block| block.len()))
+            .sum())
+    }
+
+    fn block(&self, block_idx: usize, metrics: &dyn MetricsCollector) -> Result<Arc<Vec<u8>>> {
+        if block_idx >= self.num_blocks {
+            return Err(Error::Internal {
+                message: format!(
+                    "block index {} out of bounds for token {}",
+                    block_idx, self.token_id
+                ),
+                location: location!(),
+            });
+        }
+
+        {
+            let blocks = self.blocks.lock().map_err(|_| Error::Internal {
+                message: "posting block mutex poisoned".to_string(),
+                location: location!(),
+            })?;
+            if let Some(block) = blocks[block_idx].as_ref() {
+                return Ok(block.clone());
+            }
+        }
+
+        let request = BlockRequest {
+            token_id: self.token_id,
+            block_idx,
+        };
+        let mut loaded = self
+            .loader
+            .load_blocks_blocking(std::slice::from_ref(&request), metrics)?;
+        let block = loaded.remove(&request).ok_or(Error::Internal {
+            message: "failed to load posting block".to_string(),
+            location: location!(),
+        })?;
+
+        let mut blocks = self.blocks.lock().map_err(|_| Error::Internal {
+            message: "posting block mutex poisoned".to_string(),
+            location: location!(),
+        })?;
+        if blocks[block_idx].is_none() {
+            blocks[block_idx] = Some(block.clone());
+        }
+        Ok(block)
+    }
+
+    pub(crate) fn store_block(&self, block_idx: usize, block: Arc<Vec<u8>>) -> Result<()> {
+        if block_idx >= self.num_blocks {
+            return Err(Error::Internal {
+                message: format!(
+                    "block index {} out of bounds for token {}",
+                    block_idx, self.token_id
+                ),
+                location: location!(),
+            });
+        }
+        let mut blocks = self.blocks.lock().map_err(|_| Error::Internal {
+            message: "posting block mutex poisoned".to_string(),
+            location: location!(),
+        })?;
+        if blocks[block_idx].is_none() {
+            blocks[block_idx] = Some(block);
+        }
+        Ok(())
+    }
+}
+
+impl Clone for LazyPostingBlocks {
+    fn clone(&self) -> Self {
+        let blocks = self.blocks.lock().unwrap_or_else(|err| err.into_inner());
+        Self {
+            token_id: self.token_id,
+            num_blocks: self.num_blocks,
+            loader: self.loader.clone(),
+            blocks: std::sync::Mutex::new(blocks.clone()),
+        }
+    }
+}
+
+impl PartialEq for LazyPostingBlocks {
+    fn eq(&self, other: &Self) -> bool {
+        if std::ptr::eq(self, other) {
+            return true;
+        }
+        if self.token_id != other.token_id || self.num_blocks != other.num_blocks {
+            return false;
+        }
+        let left = self.blocks.lock();
+        let right = other.blocks.lock();
+        match (left, right) {
+            (Ok(left), Ok(right)) => *left == *right,
+            _ => false,
+        }
     }
 }
 
@@ -1896,17 +2157,31 @@ impl PlainPostingList {
     }
 }
 
+pub enum BlockBytes<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Arc<Vec<u8>>),
+}
+
+impl BlockBytes<'_> {
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 pub enum PostingBlocks {
     Array(LargeBinaryArray),
-    Cached(Vec<Arc<Vec<u8>>>),
+    Lazy(LazyPostingBlocks),
 }
 
 impl PostingBlocks {
     pub fn len(&self) -> usize {
         match self {
             Self::Array(blocks) => blocks.len(),
-            Self::Cached(blocks) => blocks.len(),
+            Self::Lazy(blocks) => blocks.len(),
         }
     }
 
@@ -1914,17 +2189,25 @@ impl PostingBlocks {
         self.len() == 0
     }
 
-    pub fn value(&self, idx: usize) -> &[u8] {
+    pub fn is_lazy(&self) -> bool {
+        matches!(self, Self::Lazy(_))
+    }
+
+    pub fn block<'a>(
+        &'a self,
+        idx: usize,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<BlockBytes<'a>> {
         match self {
-            Self::Array(blocks) => blocks.value(idx),
-            Self::Cached(blocks) => blocks[idx].as_slice(),
+            Self::Array(blocks) => Ok(BlockBytes::Borrowed(blocks.value(idx))),
+            Self::Lazy(blocks) => Ok(BlockBytes::Owned(blocks.block(idx, metrics)?)),
         }
     }
 
     pub fn get_buffer_memory_size(&self) -> usize {
         match self {
             Self::Array(blocks) => blocks.get_buffer_memory_size(),
-            Self::Cached(blocks) => blocks.iter().map(|block| block.len()).sum(),
+            Self::Lazy(blocks) => blocks.loaded_size().unwrap_or(0),
         }
     }
 }
@@ -1985,6 +2268,9 @@ impl CompressedPostingList {
     }
 
     pub fn iter(&self) -> CompressedPostingListIterator {
+        if self.blocks.is_lazy() {
+            panic!("posting list iterator requires materialized blocks");
+        }
         CompressedPostingListIterator::new(
             self.length as usize,
             self.blocks.clone(),
@@ -1992,14 +2278,24 @@ impl CompressedPostingList {
         )
     }
 
-    pub fn block_max_score(&self, block_idx: usize) -> f32 {
-        let block = self.blocks.value(block_idx);
-        block[0..4].try_into().map(f32::from_le_bytes).unwrap()
+    pub fn block_max_score(&self, block_idx: usize, metrics: &dyn MetricsCollector) -> Result<f32> {
+        let block = self.blocks.block(block_idx, metrics)?;
+        Ok(block.as_slice()[0..4]
+            .try_into()
+            .map(f32::from_le_bytes)
+            .unwrap())
     }
 
-    pub fn block_least_doc_id(&self, block_idx: usize) -> u32 {
-        let block = self.blocks.value(block_idx);
-        block[4..8].try_into().map(u32::from_le_bytes).unwrap()
+    pub fn block_least_doc_id(
+        &self,
+        block_idx: usize,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<u32> {
+        let block = self.blocks.block(block_idx, metrics)?;
+        Ok(block.as_slice()[4..8]
+            .try_into()
+            .map(u32::from_le_bytes)
+            .unwrap())
     }
 }
 
@@ -2849,8 +3145,20 @@ mod tests {
             .unwrap();
 
         let stats = cache.stats().await;
-        let expected_blocks = num_docs.div_ceil(BLOCK_SIZE);
-        assert_eq!(stats.num_entries, expected_blocks);
+        assert_eq!(stats.num_entries, 0);
+
+        let request = partition
+            .inverted_list
+            .block_request(0, 0)
+            .unwrap()
+            .expect("block request should exist");
+        partition
+            .inverted_list
+            .prefetch_blocks(&[request], &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let stats = cache.stats().await;
+        assert_eq!(stats.num_entries, 1);
     }
 
     #[tokio::test]

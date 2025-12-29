@@ -102,6 +102,10 @@ impl CompressedPostingListIterator {
             length,
             blocks.len(),
         );
+        debug_assert!(
+            matches!(&blocks, PostingBlocks::Array(_)),
+            "CompressedPostingListIterator requires materialized blocks"
+        );
 
         Self {
             remainder: length % BLOCK_SIZE,
@@ -133,7 +137,10 @@ impl Iterator for CompressedPostingListIterator {
         if self.next_block_idx >= self.blocks.len() {
             return None;
         }
-        let compressed = self.blocks.value(self.next_block_idx);
+        let compressed = match &self.blocks {
+            PostingBlocks::Array(blocks) => blocks.value(self.next_block_idx),
+            PostingBlocks::Lazy(_) => unreachable!("CompressedPostingListIterator needs blocks"),
+        };
         self.next_block_idx += 1;
 
         let mut doc_ids = Vec::with_capacity(BLOCK_SIZE);
