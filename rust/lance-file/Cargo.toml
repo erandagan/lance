@@ -58,6 +58,7 @@ pprof = { workspace = true }
 
 [features]
 protoc = ["dep:protobuf-src"]
+uring = ["lance-io/uring"]
 
 [package.metadata.docs.rs]
 # docs.rs uses an older version of Ubuntu that does not have the necessary protoc version

@@ -32,6 +32,8 @@ use tokio::io::AsyncWriteExt;
 use url::Url;
 
 use super::local::LocalObjectReader;
+#[cfg(all(target_os = "linux", feature = "uring"))]
+use crate::uring::UringReader;
 mod list_retry;
 pub mod providers;
 pub mod storage_options;
@@ -567,6 +569,16 @@ impl ObjectStore {
                 )
                 .await
             }
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            "file+uring" => {
+                UringReader::open(
+                    path,
+                    self.block_size,
+                    None,
+                    Arc::new(self.io_tracker.clone()),
+                )
+                .await
+            }
             _ => Ok(Box::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
@@ -597,6 +609,16 @@ impl ObjectStore {
         match self.scheme.as_str() {
             "file" => {
                 LocalObjectReader::open_with_tracker(
+                    path,
+                    self.block_size,
+                    Some(known_size),
+                    Arc::new(self.io_tracker.clone()),
+                )
+                .await
+            }
+            #[cfg(all(target_os = "linux", feature = "uring"))]
+            "file+uring" => {
+                UringReader::open(
                     path,
                     self.block_size,
                     Some(known_size),

@@ -126,7 +126,13 @@ static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 fn bench_random_access(c: &mut Criterion) {
     const TOTAL_ROWS: usize = 10_000;
-    for filesystem in ["mem", "disk"] {
+
+    #[cfg(all(target_os = "linux", feature = "uring"))]
+    let filesystems = ["mem", "disk", "uring"];
+    #[cfg(not(all(target_os = "linux", feature = "uring")))]
+    let filesystems = ["mem", "disk"];
+
+    for filesystem in filesystems {
         for version in [LanceFileVersion::V2_0, LanceFileVersion::V2_1] {
             let mut group = c.benchmark_group(format!("reader_{}_{}", version, filesystem));
             for rows_at_a_time in [1, 100] {
@@ -144,6 +150,14 @@ fn bench_random_access(c: &mut Criterion) {
 
                 let (object_store, base_path) = if filesystem == "mem" {
                     rt.block_on(ObjectStore::from_uri("memory://")).unwrap()
+                } else if filesystem == "uring" {
+                    #[cfg(all(target_os = "linux", feature = "uring"))]
+                    {
+                        let uri = format!("file+uring://{}", tmpdir.path_str());
+                        rt.block_on(ObjectStore::from_uri(&uri)).unwrap()
+                    }
+                    #[cfg(not(all(target_os = "linux", feature = "uring")))]
+                    unreachable!()
                 } else {
                     rt.block_on(ObjectStore::from_uri(&tmpdir.path_str()))
                         .unwrap()
@@ -173,10 +187,11 @@ fn bench_random_access(c: &mut Criterion) {
                 let object_store = &object_store;
                 let file_path = &file_path;
                 let reader = rt.block_on(async move {
-                    let store_scheduler = ScanScheduler::new(
+                    let store_scheduler = ScanScheduler::try_new(
                         object_store.clone(),
-                        SchedulerConfig::default_for_testing(),
-                    );
+                        SchedulerConfig::default_for_testing(true),
+                    )
+                    .unwrap();
                     let scheduler = store_scheduler
                         .open_file(file_path, &CachedFileSize::unknown())
                         .await

@@ -127,6 +127,7 @@ datafusion-physical-expr = "50.0.0"
 datafusion-physical-plan = "50.0.0"
 datafusion-substrait = "50.0.0"
 deepsize = "0.2.0"
+dashmap = "6.0"
 dirs = "6.0.0"
 either = "1.0"
 fst = { version = "0.4.7", features = ["levenshtein"] }
@@ -139,6 +140,7 @@ geo-types = "0.7.16"
 http = "1.1.0"
 humantime = "2.2.0"
 hyperloglogplus = { version = "0.4.1", features = ["const-loop"] }
+io-uring = "0.7"
 itertools = "0.13"
 jieba-rs = { version = "0.8.1", default-features = false }
 jsonb = { version = "0.5.3", default-features = false, features = ["databend"] }

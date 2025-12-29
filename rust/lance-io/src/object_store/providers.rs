@@ -75,6 +75,7 @@ pub trait ObjectStoreProvider: std::fmt::Debug + Sync + Send {
 /// - `file`: A local file object store, with optimized code paths.
 /// - `file-object-store`: A local file object store that uses the ObjectStore API,
 ///   for all operations. Used for testing with ObjectStore wrappers.
+/// - `file+uring`: A local file object store using io_uring (Linux only, requires uring feature).
 /// - `s3`: An S3 object store.
 /// - `s3+ddb`: An S3 object store with DynamoDB for metadata.
 /// - `az`: An Azure Blob Storage object store.
@@ -261,6 +262,8 @@ impl Default for ObjectStoreRegistry {
             "file-object-store".into(),
             Arc::new(local::FileStoreProvider),
         );
+        #[cfg(all(target_os = "linux", feature = "uring"))]
+        providers.insert("file+uring".into(), Arc::new(local::FileStoreProvider));
 
         #[cfg(feature = "aws")]
         {
