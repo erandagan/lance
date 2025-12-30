@@ -138,6 +138,108 @@ pub(crate) fn prefetch_arrow_array(array: &dyn Array) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum PrefetchReadWrite {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum PrefetchLocality {
+    Streaming,
+    Low,
+    Medium,
+    High,
+}
+
+#[inline(always)]
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub(crate) unsafe fn prefetch(ptr: *const i8, rw: PrefetchReadWrite, locality: PrefetchLocality) {
+    use core::arch::x86_64::{
+        _mm_prefetch, _MM_HINT_NTA, _MM_HINT_T0, _MM_HINT_T1, _MM_HINT_T2,
+    };
+    let hint = match locality {
+        PrefetchLocality::Streaming => _MM_HINT_NTA,
+        PrefetchLocality::Low => _MM_HINT_T2,
+        PrefetchLocality::Medium => _MM_HINT_T1,
+        PrefetchLocality::High => _MM_HINT_T0,
+    };
+    let _ = rw;
+    _mm_prefetch(ptr, hint);
+}
+
+#[inline(always)]
+#[cfg(target_arch = "aarch64")]
+pub(crate) unsafe fn prefetch(ptr: *const i8, rw: PrefetchReadWrite, locality: PrefetchLocality) {
+    use core::arch::asm;
+    match (rw, locality) {
+        (PrefetchReadWrite::Read, PrefetchLocality::Streaming) => {
+            asm!(
+                "prfm PLDL1STRM, [{0}]",
+                in(reg) ptr,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        (PrefetchReadWrite::Read, PrefetchLocality::Low) => {
+            asm!(
+                "prfm PLDL3KEEP, [{0}]",
+                in(reg) ptr,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        (PrefetchReadWrite::Read, PrefetchLocality::Medium) => {
+            asm!(
+                "prfm PLDL2KEEP, [{0}]",
+                in(reg) ptr,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        (PrefetchReadWrite::Read, PrefetchLocality::High) => {
+            asm!(
+                "prfm PLDL1KEEP, [{0}]",
+                in(reg) ptr,
+                options(nostack, preserves_flags, readonly)
+            );
+        }
+        (PrefetchReadWrite::Write, PrefetchLocality::Streaming) => {
+            asm!(
+                "prfm PSTL1STRM, [{0}]",
+                in(reg) ptr,
+                options(nostack, preserves_flags)
+            );
+        }
+        (PrefetchReadWrite::Write, PrefetchLocality::Low) => {
+            asm!(
+                "prfm PSTL3KEEP, [{0}]",
+                in(reg) ptr,
+                options(nostack, preserves_flags)
+            );
+        }
+        (PrefetchReadWrite::Write, PrefetchLocality::Medium) => {
+            asm!(
+                "prfm PSTL2KEEP, [{0}]",
+                in(reg) ptr,
+                options(nostack, preserves_flags)
+            );
+        }
+        (PrefetchReadWrite::Write, PrefetchLocality::High) => {
+            asm!(
+                "prfm PSTL1KEEP, [{0}]",
+                in(reg) ptr,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+}
+
+#[inline(always)]
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) unsafe fn prefetch(ptr: *const i8, rw: PrefetchReadWrite, locality: PrefetchLocality) {
+    let _ = (ptr, rw, locality);
+}
+
 #[inline]
 pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
     // TODO use rust intrinsics instead of x86 intrinsics
@@ -147,11 +249,11 @@ pub(crate) fn do_prefetch<T>(ptrs: Range<*const T>) {
         let mut current_ptr = ptr;
         while current_ptr < end_ptr {
             const CACHE_LINE_SIZE: usize = 64;
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            {
-                use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                _mm_prefetch(current_ptr, _MM_HINT_T0);
-            }
+            prefetch(
+                current_ptr,
+                PrefetchReadWrite::Read,
+                PrefetchLocality::High,
+            );
             current_ptr = current_ptr.add(CACHE_LINE_SIZE);
         }
     }
@@ -293,6 +395,19 @@ mod tests {
     use half::f16;
     use lance_arrow::FixedSizeListArrayExt;
     use num_traits::identities::Zero;
+
+    #[test]
+    fn test_prefetch_smoke() {
+        let data = vec![0_u8; 256];
+        do_prefetch(data.as_ptr_range());
+        unsafe {
+            prefetch(
+                data.as_ptr() as *const i8,
+                PrefetchReadWrite::Read,
+                PrefetchLocality::High,
+            );
+        }
+    }
 
     #[test]
     fn test_fsl_to_tensor() {

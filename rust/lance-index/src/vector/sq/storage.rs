@@ -469,22 +469,20 @@ impl DistCalculator for SQDistCalculator<'_> {
 
     #[allow(unused_variables)]
     fn prefetch(&self, id: u32) {
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            const CACHE_LINE_SIZE: usize = 64;
+        const CACHE_LINE_SIZE: usize = 64;
 
-            let (offset, chunk) = self.storage.chunk(id);
-            let dim = chunk.dim();
-            let base_ptr = chunk.sq_code_slice(id - offset).as_ptr();
+        let (offset, chunk) = self.storage.chunk(id);
+        let dim = chunk.dim();
+        let base_ptr = chunk.sq_code_slice(id - offset).as_ptr();
 
-            unsafe {
-                // Loop over the sq_code to prefetch each cache line
-                for offset in (0..dim).step_by(CACHE_LINE_SIZE) {
-                    {
-                        use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                        _mm_prefetch(base_ptr.add(offset) as *const i8, _MM_HINT_T0);
-                    }
-                }
+        unsafe {
+            // Loop over the sq_code to prefetch each cache line.
+            for offset in (0..dim).step_by(CACHE_LINE_SIZE) {
+                crate::vector::utils::prefetch(
+                    base_ptr.add(offset) as *const i8,
+                    crate::vector::utils::PrefetchReadWrite::Read,
+                    crate::vector::utils::PrefetchLocality::High,
+                );
             }
         }
     }
