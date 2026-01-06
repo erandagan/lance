@@ -1712,8 +1712,8 @@ impl PostingListReader {
     }
 
     async fn prewarm(&self) -> Result<()> {
-        let batch = self.read_batch(false).await?;
         if self.offsets.is_some() {
+            let batch = self.read_batch(false).await?;
             for token_id in 0..self.len() {
                 let posting_range = self.posting_list_range(token_id as u32);
                 let batch =
@@ -1740,7 +1740,8 @@ impl PostingListReader {
                     });
                 }
             }
-        } else {
+        } else if self.block_metadata.is_none() {
+            let batch = self.read_batch(false).await?;
             let posting_lists = batch[POSTING_COL].as_list::<i32>();
             for token_id in 0..self.len() {
                 let block_values = posting_lists.value(token_id);
@@ -1765,6 +1766,27 @@ impl PostingListReader {
                         });
                     }
                 }
+            }
+        } else {
+            let metrics = NoOpMetricsCollector;
+            let mut pending = Vec::new();
+            let mut pending_size = 0usize;
+            let batch_limit = 4096usize;
+            for token_id in 0..self.len() {
+                let mut requests = self.prefetch_requests_for_token(token_id as u32).await?;
+                if requests.is_empty() {
+                    continue;
+                }
+                pending_size += requests.len();
+                pending.append(&mut requests);
+                if pending_size >= batch_limit {
+                    self.prefetch_blocks(&pending, &metrics).await?;
+                    pending.clear();
+                    pending_size = 0;
+                }
+            }
+            if !pending.is_empty() {
+                self.prefetch_blocks(&pending, &metrics).await?;
             }
         }
 
@@ -3676,6 +3698,41 @@ mod tests {
         let middle_idx = *PREFETCH_PREFIX_NUM + 1;
         assert!(middle_idx < top_start);
         assert!(!requested.contains(&middle_idx));
+    }
+
+    #[tokio::test]
+    async fn test_prewarm_respects_prefetch_limits() {
+        let tmpdir = TempObjDir::default();
+        let cache = Arc::new(LanceCache::with_capacity(1024 * 1024 * 64));
+        let store = Arc::new(LanceIndexStore::new(
+            ObjectStore::local().into(),
+            tmpdir.clone(),
+            cache.clone(),
+        ));
+
+        let num_blocks = *PREFETCH_PREFIX_NUM + *PREFETCH_TOP_NUM + 4;
+        let num_docs = BLOCK_SIZE * num_blocks;
+        let mut builder = InnerBuilder::new(0, false, TokenSetFormat::default());
+        builder.tokens.add("block".to_owned());
+        builder.posting_lists.push(PostingListBuilder::new(false));
+        for doc_id in 0..num_docs {
+            builder.posting_lists[0].add(doc_id as u32, PositionRecorder::Count(1));
+            builder.docs.append(doc_id as u64, 1);
+        }
+        builder.write(store.as_ref()).await.unwrap();
+
+        let partition =
+            InvertedPartition::load(store, 0, None, cache.as_ref(), TokenSetFormat::default())
+                .await
+                .unwrap();
+
+        cache.clear().await;
+        partition.inverted_list.prewarm().await.unwrap();
+        let stats = cache.stats().await;
+
+        assert!(stats.num_entries > 0);
+        assert!(stats.num_entries <= *PREFETCH_PREFIX_NUM + *PREFETCH_TOP_NUM);
+        assert!(stats.num_entries < num_blocks);
     }
 
     #[tokio::test]
