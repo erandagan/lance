@@ -160,6 +160,17 @@ impl Dot for u8 {
     }
 }
 
+impl Dot for i8 {
+    #[inline]
+    fn dot(x: &[Self], y: &[Self]) -> f32 {
+        // TODO: this is not optimized for auto vectorization yet.
+        x.iter()
+            .zip(y.iter())
+            .map(|(&x_i, &y_i)| x_i as i32 * y_i as i32)
+            .sum::<i32>() as f32
+    }
+}
+
 /// Negative dot product, to present the relative order of dot distance.
 pub fn dot_distance_batch<'a, T: Dot>(
     from: &'a [T],

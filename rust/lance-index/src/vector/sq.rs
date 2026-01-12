@@ -5,7 +5,7 @@ use std::{ops::Range, sync::Arc};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Int8Array};
 
 use arrow_schema::{DataType, Field};
 use builder::SQBuildParams;
@@ -113,10 +113,10 @@ impl ScalarQuantizer {
             .as_slice();
 
         // TODO: support SQ4
-        let builder: Vec<u8> = scale_to_u8::<T>(data, &self.metadata.bounds);
+        let builder: Vec<i8> = scale_to_i8::<T>(data, &self.metadata.bounds);
 
         Ok(Arc::new(FixedSizeListArray::try_new_from_values(
-            UInt8Array::from(builder),
+            Int8Array::from(builder),
             fsl.value_length(),
         )?))
     }
@@ -252,7 +252,7 @@ impl Quantization for ScalarQuantizer {
         Field::new(
             SQ_CODE_COLUMN,
             DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt8, true)),
+                Arc::new(Field::new("item", DataType::Int8, true)),
                 self.code_dim() as i32,
             ),
             true,
@@ -260,7 +260,7 @@ impl Quantization for ScalarQuantizer {
     }
 }
 
-pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: &Range<f64>) -> Vec<u8> {
+pub(crate) fn scale_to_i8<T: ArrowFloatType>(values: &[T::Native], bounds: &Range<f64>) -> Vec<i8> {
     if bounds.start == bounds.end {
         return vec![0; values.len()];
     }
@@ -270,8 +270,8 @@ pub(crate) fn scale_to_u8<T: ArrowFloatType>(values: &[T::Native], bounds: &Rang
         .iter()
         .map(|&v| {
             let v = v.to_f64().unwrap();
-            let v = (v - bounds.start) * 255.0 / range;
-            v as u8 // rust `as` performs saturating cast when casting float to int, so it's safe and expected here
+            let v = (v - bounds.start) * 255.0 / range - 128.0;
+            v as i8 // rust `as` performs saturating cast when casting float to int, so it's safe and expected here
         })
         .collect_vec()
 }
@@ -305,11 +305,11 @@ mod tests {
             .as_fixed_size_list()
             .values()
             .as_any()
-            .downcast_ref::<UInt8Array>()
+            .downcast_ref::<Int8Array>()
             .unwrap();
 
         sq_values.values().iter().enumerate().for_each(|(i, v)| {
-            assert_eq!(*v, (i * 17) as u8);
+            assert_eq!(*v as i16, -128 + (i as i16 * 17));
         });
     }
 
@@ -334,11 +334,11 @@ mod tests {
             .as_fixed_size_list()
             .values()
             .as_any()
-            .downcast_ref::<UInt8Array>()
+            .downcast_ref::<Int8Array>()
             .unwrap();
 
         sq_values.values().iter().enumerate().for_each(|(i, v)| {
-            assert_eq!(*v, (i * 17) as u8,);
+            assert_eq!(*v as i16, -128 + (i as i16 * 17),);
         });
     }
 
@@ -360,22 +360,22 @@ mod tests {
             .as_fixed_size_list()
             .values()
             .as_any()
-            .downcast_ref::<UInt8Array>()
+            .downcast_ref::<Int8Array>()
             .unwrap();
 
         sq_values.values().iter().enumerate().for_each(|(i, v)| {
-            assert_eq!(*v, (i * 17) as u8,);
+            assert_eq!(*v as i16, -128 + (i as i16 * 17),);
         });
     }
 
     #[tokio::test]
-    async fn test_scale_to_u8_with_nan() {
+    async fn test_scale_to_i8_with_nan() {
         let values = vec![0.0, 1.0, 2.0, 3.0, f64::NAN];
         let bounds = Range::<f64> {
             start: 0.0,
             end: 3.0,
         };
-        let u8_values = scale_to_u8::<Float64Type>(&values, &bounds);
-        assert_eq!(u8_values, vec![0, 85, 170, 255, 0]);
+        let i8_values = scale_to_i8::<Float64Type>(&values, &bounds);
+        assert_eq!(i8_values, vec![-128, -43, 42, 127, 0]);
     }
 }

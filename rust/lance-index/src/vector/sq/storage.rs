@@ -7,8 +7,8 @@ use arrow::datatypes::Float64Type;
 use arrow::{compute::concat_batches, datatypes::Float16Type};
 use arrow_array::{
     cast::AsArray,
-    types::{Float32Type, UInt64Type, UInt8Type},
-    ArrayRef, RecordBatch, UInt64Array, UInt8Array,
+    types::{Float32Type, Int8Type, UInt64Type, UInt8Type},
+    ArrayRef, Int8Array, RecordBatch, UInt64Array,
 };
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
@@ -16,14 +16,14 @@ use deepsize::DeepSizeOf;
 use lance_core::{Error, Result, ROW_ID};
 use lance_file::previous::reader::FileReader as PreviousFileReader;
 use lance_io::object_store::ObjectStore;
-use lance_linalg::distance::{dot_distance, l2_distance_uint_scalar, DistanceType};
+use lance_linalg::distance::{dot_distance, l2_distance_int_scalar, DistanceType};
 use lance_table::format::SelfDescribingFileReader;
 use object_store::path::Path;
 use serde::{Deserialize, Serialize};
 use snafu::location;
 use std::sync::Arc;
 
-use super::{scale_to_u8, ScalarQuantizer};
+use super::{scale_to_i8, ScalarQuantizer};
 use crate::frag_reuse::FragReuseIndex;
 use crate::{
     vector::{
@@ -82,7 +82,7 @@ struct SQStorageChunk {
     // These fields share the `Arc` pointer to the columns in batch,
     // so it does not take more memory.
     row_ids: UInt64Array,
-    sq_codes: UInt8Array,
+    sq_codes: Int8Array,
 }
 
 impl SQStorageChunk {
@@ -104,14 +104,22 @@ impl SQStorageChunk {
             })?
             .as_fixed_size_list();
         let dim = fsl.value_length() as usize;
-        let sq_codes = fsl
-            .values()
-            .as_primitive_opt::<UInt8Type>()
-            .ok_or(Error::Index {
-                message: "SQ code column is not FixedSizeList<u8>".to_owned(),
+        let values = fsl.values();
+        let sq_codes = if let Some(values_i8) = values.as_primitive_opt::<Int8Type>() {
+            values_i8.clone()
+        } else if let Some(values_u8) = values.as_primitive_opt::<UInt8Type>() {
+            let converted = values_u8
+                .values()
+                .iter()
+                .map(|&v| (v as i16 - 128) as i8)
+                .collect::<Vec<_>>();
+            Int8Array::from(converted)
+        } else {
+            return Err(Error::Index {
+                message: "SQ code column is not FixedSizeList<i8> or FixedSizeList<u8>".to_owned(),
                 location: location!(),
-            })?
-            .clone();
+            });
+        };
         Ok(Self {
             batch,
             dim,
@@ -140,7 +148,7 @@ impl SQStorageChunk {
 
     /// Get a slice of SQ code for id
     #[inline]
-    fn sq_code_slice(&self, id: u32) -> &[u8] {
+    fn sq_code_slice(&self, id: u32) -> &[i8] {
         // assert!(id < self.len() as u32);
         &self.sq_codes.values()[id as usize * self.dim..(id + 1) as usize * self.dim]
     }
@@ -403,7 +411,7 @@ fn sq_distance_scale(bounds: &Range<f64>) -> f32 {
 }
 
 pub struct SQDistCalculator<'a> {
-    query_sq_code: Vec<u8>,
+    query_sq_code: Vec<i8>,
     scale: f32,
     storage: &'a ScalarQuantizationStorage,
 }
@@ -416,13 +424,13 @@ impl<'a> SQDistCalculator<'a> {
         // dist calculator frequently. However, HNSW isn't first-class citizen in Lance yet. so be it.
         let query_sq_code = match query.data_type() {
             DataType::Float16 => {
-                scale_to_u8::<Float16Type>(query.as_primitive::<Float16Type>().values(), &bounds)
+                scale_to_i8::<Float16Type>(query.as_primitive::<Float16Type>().values(), &bounds)
             }
             DataType::Float32 => {
-                scale_to_u8::<Float32Type>(query.as_primitive::<Float32Type>().values(), &bounds)
+                scale_to_i8::<Float32Type>(query.as_primitive::<Float32Type>().values(), &bounds)
             }
             DataType::Float64 => {
-                scale_to_u8::<Float64Type>(query.as_primitive::<Float64Type>().values(), &bounds)
+                scale_to_i8::<Float64Type>(query.as_primitive::<Float64Type>().values(), &bounds)
             }
             _ => {
                 panic!("Unsupported data type for ScalarQuantizationStorage");
@@ -442,7 +450,7 @@ impl DistCalculator for SQDistCalculator<'_> {
         let sq_code = chunk.sq_code_slice(id - offset);
         let dist = match self.storage.distance_type {
             DistanceType::L2 | DistanceType::Cosine => {
-                l2_distance_uint_scalar(sq_code, &self.query_sq_code)
+                l2_distance_int_scalar(sq_code, &self.query_sq_code)
             }
             DistanceType::Dot => dot_distance(sq_code, &self.query_sq_code),
             _ => panic!("We should not reach here: sq distance can only be L2 or Dot"),
@@ -460,7 +468,7 @@ impl DistCalculator for SQDistCalculator<'_> {
                     c.sq_codes
                         .values()
                         .chunks_exact(c.dim())
-                        .map(|sq_codes| l2_distance_uint_scalar(sq_codes, &self.query_sq_code))
+                        .map(|sq_codes| l2_distance_int_scalar(sq_codes, &self.query_sq_code))
                 })
                 .map(|dist| dist * self.scale)
                 .collect(),
@@ -510,7 +518,7 @@ mod tests {
     use std::iter::repeat_with;
     use std::sync::Arc;
 
-    use arrow_array::FixedSizeListArray;
+    use arrow_array::{FixedSizeListArray, UInt8Array};
     use arrow_schema::{DataType, Field, Schema};
     use lance_arrow::FixedSizeListArrayExt;
     use lance_testing::datagen::generate_random_array;
@@ -521,8 +529,8 @@ mod tests {
 
         let mut rng = rand::rng();
         let row_ids = UInt64Array::from_iter_values(row_ids);
-        let sq_code = UInt8Array::from_iter_values(
-            repeat_with(|| rng.random::<u8>()).take(row_ids.len() * DIM),
+        let sq_code = Int8Array::from_iter_values(
+            repeat_with(|| rng.random::<i8>()).take(row_ids.len() * DIM),
         );
         let code_arr = FixedSizeListArray::try_new_from_values(sq_code, DIM as i32).unwrap();
 
@@ -531,7 +539,7 @@ mod tests {
             Field::new(
                 SQ_CODE_COLUMN,
                 DataType::FixedSizeList(
-                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    Arc::new(Field::new("item", DataType::Int8, true)),
                     DIM as i32,
                 ),
                 false,
@@ -590,5 +598,35 @@ mod tests {
         let (offset, chunk) = storage.chunk(432);
         assert_eq!(offset, 400);
         assert_eq!(chunk.row_id(5), 105);
+    }
+
+    #[test]
+    fn test_u8_codes_are_converted() {
+        let row_ids = UInt64Array::from_iter_values(0..2);
+        let sq_code = UInt8Array::from(vec![0_u8, 255_u8]);
+        let code_arr = FixedSizeListArray::try_new_from_values(sq_code, 1).unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(
+                SQ_CODE_COLUMN,
+                DataType::FixedSizeList(Arc::new(Field::new("item", DataType::UInt8, true)), 1),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(row_ids), Arc::new(code_arr)])
+            .unwrap();
+
+        let storage = ScalarQuantizationStorage::try_new(
+            8,
+            DistanceType::L2,
+            0.0..255.0,
+            [batch],
+            None,
+        )
+        .unwrap();
+
+        let dist = storage.dist_calculator_from_id(0).distance(1);
+        assert_eq!(dist, 65025.0);
     }
 }

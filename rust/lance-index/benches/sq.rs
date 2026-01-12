@@ -5,7 +5,7 @@
 
 use std::{iter::repeat_with, ops::Range, sync::Arc, time::Duration};
 
-use arrow_array::{FixedSizeListArray, RecordBatch, UInt64Array, UInt8Array};
+use arrow_array::{FixedSizeListArray, Int8Array, RecordBatch, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use criterion::{criterion_group, criterion_main, Criterion};
 use lance_arrow::{FixedSizeListArrayExt, RecordBatchExt};
@@ -24,7 +24,7 @@ fn create_full_batch(range: Range<u64>, dim: usize) -> RecordBatch {
     let mut rng = rand::rng();
     let row_ids = UInt64Array::from_iter_values(range);
     let sq_code =
-        UInt8Array::from_iter_values(repeat_with(|| rng.random::<u8>()).take(row_ids.len() * dim));
+        Int8Array::from_iter_values(repeat_with(|| rng.random::<i8>()).take(row_ids.len() * dim));
     let sq_code_fsl = FixedSizeListArray::try_new_from_values(sq_code, dim as i32).unwrap();
 
     let vector_data = generate_random_array(row_ids.len() * dim);
@@ -35,7 +35,7 @@ fn create_full_batch(range: Range<u64>, dim: usize) -> RecordBatch {
         Field::new(
             SQ_CODE_COLUMN,
             DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::UInt8, true)),
+                Arc::new(Field::new("item", DataType::Int8, true)),
                 dim as i32,
             ),
             false,

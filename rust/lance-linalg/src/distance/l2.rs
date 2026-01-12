@@ -48,6 +48,18 @@ pub fn l2_distance_uint_scalar(key: &[u8], target: &[u8]) -> f32 {
         .sum::<u32>() as f32
 }
 
+/// Calculate L2 distance between two int8 slices.
+#[inline]
+pub fn l2_distance_int_scalar(key: &[i8], target: &[i8]) -> f32 {
+    key.iter()
+        .zip(target.iter())
+        .map(|(&x, &y)| {
+            let diff = x as i32 - y as i32;
+            (diff * diff) as u32
+        })
+        .sum::<u32>() as f32
+}
+
 /// Calculate the L2 distance between two vectors, using scalar operations.
 ///
 /// It relies on LLVM for auto-vectorization and unrolling.
@@ -94,6 +106,13 @@ impl L2 for u8 {
     #[inline]
     fn l2(x: &[Self], y: &[Self]) -> f32 {
         l2_distance_uint_scalar(x, y)
+    }
+}
+
+impl L2 for i8 {
+    #[inline]
+    fn l2(x: &[Self], y: &[Self]) -> f32 {
+        l2_distance_int_scalar(x, y)
     }
 }
 
