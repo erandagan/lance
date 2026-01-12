@@ -33,7 +33,7 @@ use url::Url;
 
 use super::local::LocalObjectReader;
 #[cfg(all(target_os = "linux", feature = "uring"))]
-use crate::uring::UringReader;
+use crate::uring::{UringCurrentThreadReader, UringReader};
 mod list_retry;
 pub mod providers;
 pub mod storage_options;
@@ -571,13 +571,28 @@ impl ObjectStore {
             }
             #[cfg(all(target_os = "linux", feature = "uring"))]
             "file+uring" => {
-                UringReader::open(
-                    path,
-                    self.block_size,
-                    None,
-                    Arc::new(self.io_tracker.clone()),
-                )
-                .await
+                // Check if current-thread mode enabled
+                let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+
+                if use_current_thread {
+                    UringCurrentThreadReader::open(
+                        path,
+                        self.block_size,
+                        None,
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                } else {
+                    UringReader::open(
+                        path,
+                        self.block_size,
+                        None,
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                }
             }
             _ => Ok(Arc::new(CloudObjectReader::new(
                 self.inner.clone(),
@@ -618,13 +633,28 @@ impl ObjectStore {
             }
             #[cfg(all(target_os = "linux", feature = "uring"))]
             "file+uring" => {
-                UringReader::open(
-                    path,
-                    self.block_size,
-                    Some(known_size),
-                    Arc::new(self.io_tracker.clone()),
-                )
-                .await
+                // Check if current-thread mode enabled
+                let use_current_thread = std::env::var("LANCE_URING_CURRENT_THREAD")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+
+                if use_current_thread {
+                    UringCurrentThreadReader::open(
+                        path,
+                        self.block_size,
+                        Some(known_size),
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                } else {
+                    UringReader::open(
+                        path,
+                        self.block_size,
+                        Some(known_size),
+                        Arc::new(self.io_tracker.clone()),
+                    )
+                    .await
+                }
             }
             _ => Ok(Arc::new(CloudObjectReader::new(
                 self.inner.clone(),

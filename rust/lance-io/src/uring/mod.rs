@@ -52,9 +52,14 @@ mod reader;
 mod requests;
 mod thread;
 
+// Thread-local io_uring implementation for current-thread runtimes
+pub(crate) mod current_thread;
+pub(crate) mod current_thread_future;
+
 #[cfg(test)]
 mod tests;
 
+pub(crate) use current_thread::UringCurrentThreadReader;
 pub use reader::UringReader;
 
 /// Default block size for io_uring reads (64KB)

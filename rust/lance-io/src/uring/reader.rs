@@ -31,13 +31,13 @@ use tracing::instrument;
 /// Cache key for UringReader instances.
 /// We cache by (path, block_size) because block_size affects reader behavior.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
-struct CacheKey {
+pub(super) struct CacheKey {
     path: String,
     block_size: usize,
 }
 
 impl CacheKey {
-    fn new(path: &Path, block_size: usize) -> Self {
+    pub(super) fn new(path: &Path, block_size: usize) -> Self {
         Self {
             path: path.to_string(),
             block_size,
@@ -47,14 +47,14 @@ impl CacheKey {
 
 /// Data stored in the cache for each opened file.
 #[derive(Clone)]
-struct CachedReaderData {
-    handle: Arc<UringFileHandle>,
-    size: usize,
+pub(super) struct CachedReaderData {
+    pub(super) handle: Arc<UringFileHandle>,
+    pub(super) size: usize,
 }
 
 /// Global cache of open file handles.
 /// Entries expire after 60 seconds to ensure files are eventually closed.
-static HANDLE_CACHE: LazyLock<moka::future::Cache<CacheKey, CachedReaderData>> =
+pub(super) static HANDLE_CACHE: LazyLock<moka::future::Cache<CacheKey, CachedReaderData>> =
     LazyLock::new(|| {
         moka::future::Cache::builder()
             .time_to_live(Duration::from_secs(60))
@@ -66,20 +66,20 @@ static HANDLE_CACHE: LazyLock<moka::future::Cache<CacheKey, CachedReaderData>> =
 ///
 /// Keeps the file alive and provides the raw file descriptor.
 #[derive(Debug)]
-struct UringFileHandle {
+pub(super) struct UringFileHandle {
     /// The file (kept alive via Arc)
     #[allow(unused)]
     file: Arc<File>,
 
     /// Raw file descriptor for io_uring
-    fd: RawFd,
+    pub(super) fd: RawFd,
 
     /// Object store path
-    path: Path,
+    pub(super) path: Path,
 }
 
 impl UringFileHandle {
-    fn new(file: File, path: Path) -> Self {
+    pub(super) fn new(file: File, path: Path) -> Self {
         let fd = file.as_raw_fd();
         Self {
             file: Arc::new(file),
@@ -201,6 +201,7 @@ impl UringReader {
             fd: self.handle.fd,
             offset,
             length,
+            thread_id: std::thread::current().id(),
             state: Mutex::new(RequestState {
                 completed: false,
                 waker: None,
