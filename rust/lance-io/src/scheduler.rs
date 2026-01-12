@@ -711,7 +711,7 @@ impl ScanScheduler {
         let block_size = self.object_store.block_size() as u64;
         let max_iop_size = self.object_store.max_iop_size();
         Ok(FileScheduler {
-            reader: reader.into(),
+            reader,
             block_size,
             root: self.clone(),
             base_priority,

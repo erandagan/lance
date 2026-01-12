@@ -110,16 +110,22 @@ fn install_atfork() {}
 ///
 /// This can also be used to convert a big chunk of synchronous work into a future
 /// so that it can be run in parallel with something like StreamExt::buffered()
+// pub fn spawn_cpu<F: FnOnce() -> Result<R> + Send + 'static, R: Send + 'static>(
+//     func: F,
+// ) -> impl Future<Output = Result<R>> {
+//     let (send, recv) = tokio::sync::oneshot::channel();
+//     // Propagate the current span into the task
+//     let span = Span::current();
+//     global_cpu_runtime().spawn_blocking(move || {
+//         let _span_guard = span.enter();
+//         let result = func();
+//         let _ = send.send(result);
+//     });
+//     recv.map(|res| res.unwrap())
+// }
+
 pub fn spawn_cpu<F: FnOnce() -> Result<R> + Send + 'static, R: Send + 'static>(
     func: F,
 ) -> impl Future<Output = Result<R>> {
-    let (send, recv) = tokio::sync::oneshot::channel();
-    // Propagate the current span into the task
-    let span = Span::current();
-    global_cpu_runtime().spawn_blocking(move || {
-        let _span_guard = span.enter();
-        let result = func();
-        let _ = send.send(result);
-    });
-    recv.map(|res| res.unwrap())
+    std::future::ready(func())
 }

@@ -71,12 +71,13 @@ tracing-subscriber = "0.3.17"
 tracing = { version = "0.1" }
 url = "2.5.0"
 bytes = "1.4"
+jemallocator = { version = "0.5", features = ["disable_initial_exec_tls"] }
 
 [features]
 default = ["rest", "rest-adapter", "credential-vendor-aws", "credential-vendor-gcp", "credential-vendor-azure"]
 datagen = ["lance-datagen"]
 fp16kernels = ["lance/fp16kernels"]
-uring = ["lance/uring"]
+uring = ["lance/uring", "lance-io/uring", "lance-file/uring"]
 rest = ["lance-namespace-impls/rest"]
 rest-adapter = ["lance-namespace-impls/rest-adapter"]
 # Credential vending features for DirectoryNamespace

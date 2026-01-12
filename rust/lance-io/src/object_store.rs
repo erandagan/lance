@@ -558,7 +558,7 @@ impl ObjectStore {
     ///
     /// Parameters
     /// - ``path``: Absolute path to the file.
-    pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
+    pub async fn open(&self, path: &Path) -> Result<Arc<dyn Reader>> {
         match self.scheme.as_str() {
             "file" => {
                 LocalObjectReader::open_with_tracker(
@@ -579,7 +579,7 @@ impl ObjectStore {
                 )
                 .await
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
+            _ => Ok(Arc::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
@@ -594,11 +594,11 @@ impl ObjectStore {
     /// This size may either have been retrieved from a list operation or
     /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
     /// call.
-    pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
+    pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Arc<dyn Reader>> {
         // If we know the file is really small, we can read the whole thing
         // as a single request.
         if known_size <= self.block_size {
-            return Ok(Box::new(SmallReader::new(
+            return Ok(Arc::new(SmallReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.download_retry_count,
@@ -626,7 +626,7 @@ impl ObjectStore {
                 )
                 .await
             }
-            _ => Ok(Box::new(CloudObjectReader::new(
+            _ => Ok(Arc::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
@@ -645,7 +645,7 @@ impl ObjectStore {
     }
 
     /// Open an [Reader] from local [std::path::Path]
-    pub async fn open_local(path: &std::path::Path) -> Result<Box<dyn Reader>> {
+    pub async fn open_local(path: &std::path::Path) -> Result<Arc<dyn Reader>> {
         let object_store = Self::local();
         let absolute_path = expand_path(path.to_string_lossy())?;
         let os_path = Path::from_absolute_path(absolute_path)?;

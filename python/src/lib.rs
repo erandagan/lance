@@ -93,6 +93,11 @@ pub use scanner::Scanner;
 
 use crate::executor::BackgroundExecutor;
 
+extern crate jemallocator;
+
+#[global_allocator]
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[cfg(not(feature = "datagen"))]
