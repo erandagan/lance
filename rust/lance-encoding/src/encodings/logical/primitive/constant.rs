@@ -18,10 +18,62 @@ use lance_core::{
 
 use crate::{
     buffer::LanceBuffer,
+    decoder::PageEncoding,
+    encoder::EncodedPage,
     encodings::logical::primitive::{CachedPageData, PageLoadTask},
+    format::ProtobufUtils21,
     repdef::{DefinitionInterpretation, RepDefUnraveler},
     EncodingsIo,
 };
+
+pub(crate) fn encode_constant_page(
+    column_idx: u32,
+    scalar: ArrayRef,
+    repdef: crate::repdef::SerializedRepDefs,
+    row_number: u64,
+    num_rows: u64,
+) -> Result<EncodedPage> {
+    let inline_value = lance_arrow::scalar::try_inline_value(&scalar);
+    let value_buffer = if inline_value.is_some() {
+        None
+    } else {
+        Some(LanceBuffer::from(
+            lance_arrow::scalar::encode_scalar_value_buffer(&scalar)?,
+        ))
+    };
+
+    let description = ProtobufUtils21::constant_layout(&repdef.def_meaning, inline_value);
+
+    let has_repdef = repdef.repetition_levels.is_some() || repdef.definition_levels.is_some();
+
+    let data = if !has_repdef {
+        value_buffer.into_iter().collect::<Vec<_>>()
+    } else {
+        let rep_bytes = repdef
+            .repetition_levels
+            .as_ref()
+            .map(|rep| LanceBuffer::reinterpret_slice(rep.clone()))
+            .unwrap_or_else(LanceBuffer::empty);
+        let def_bytes = repdef
+            .definition_levels
+            .as_ref()
+            .map(|def| LanceBuffer::reinterpret_slice(def.clone()))
+            .unwrap_or_else(LanceBuffer::empty);
+
+        match value_buffer {
+            Some(value_buffer) => vec![value_buffer, rep_bytes, def_bytes],
+            None => vec![rep_bytes, def_bytes],
+        }
+    };
+
+    Ok(EncodedPage {
+        column_idx,
+        data,
+        description: PageEncoding::Structural(description),
+        num_rows,
+        row_number,
+    })
+}
 
 #[derive(Debug)]
 struct CachedConstantState {
