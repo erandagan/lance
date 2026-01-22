@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! # RLE (Run-Length Encoding) Miniblock Format
+//! # RLE (Run-Length Encoding)
 //!
-//! RLE compression for Lance miniblock format, optimized for data with repeated values.
+//! RLE compression for Lance, optimized for data with repeated values.
 //!
 //! ## Encoding Format
 //!
@@ -40,13 +40,19 @@
 //! - The run count (number of value transitions) < 50% of total values
 //! - This indicates sufficient repetition for RLE to be effective
 //!
-//! ## Chunk Handling
+//! ## MiniBlock Chunk Handling
 //!
-//! - Maximum chunk size: 4096 values (miniblock constraint)
-//! - All chunks share two global buffers (values and lengths)
-//! - Each chunk's buffer_sizes indicate its portion of the global buffers
-//! - Non-last chunks always contain power-of-2 values
-//! - Byte limits are enforced dynamically during encoding
+//! When used in the miniblock path, all chunks share two global buffers (values and lengths).
+//! Each chunk's `buffer_sizes` identifies its slice within those global buffers. Non-last chunks
+//! contain a power-of-2 number of values.
+//!
+//! NOTE: The current encoder uses a 2048-value cap per chunk as a workaround for
+//! https://github.com/lancedb/lance/issues/4429.
+//!
+//! ## Block Format
+//!
+//! When used in the block compression path, the encoded output is a single buffer:
+//! `[8-byte header: values buffer size][values buffer][run_lengths buffer]`.
 
 use arrow_buffer::ArrowNativeType;
 use log::trace;
@@ -432,12 +438,16 @@ impl RleDecompressor {
             }));
         }
 
-        assert_eq!(
-            data.len(),
-            2,
-            "RLE decompressor expects exactly 2 buffers, got {}",
-            data.len()
-        );
+        if data.len() != 2 {
+            return Err(Error::InvalidInput {
+                location: location!(),
+                source: format!(
+                    "RLE decompressor expects exactly 2 buffers, got {}",
+                    data.len()
+                )
+                .into(),
+            });
+        }
 
         let values_buffer = &data[0];
         let lengths_buffer = &data[1];
@@ -496,11 +506,16 @@ impl RleDecompressor {
 
         let num_runs = values_buffer.len() / type_size;
         let num_length_entries = lengths_buffer.len();
-        assert_eq!(
-            num_runs, num_length_entries,
-            "Inconsistent RLE buffers: {} runs but {} length entries",
-            num_runs, num_length_entries
-        );
+        if num_runs != num_length_entries {
+            return Err(Error::InvalidInput {
+                location: location!(),
+                source: format!(
+                    "Inconsistent RLE buffers: {} runs but {} length entries",
+                    num_runs, num_length_entries
+                )
+                .into(),
+            });
+        }
 
         let values_ref = values_buffer.borrow_to_typed_slice::<T>();
         let values: &[T] = values_ref.as_ref();
@@ -564,12 +579,23 @@ impl BlockDecompressor for RleDecompressor {
             });
         }
 
-        let values_size_bytes: [u8; 8] = data[..8].try_into().unwrap();
+        let values_size_bytes: [u8; 8] = data[..8]
+            .try_into()
+            .expect("slice length already checked");
         let values_size: u64 = u64::from_le_bytes(values_size_bytes);
 
         // parse values
         let values_start: usize = 8;
-        let lengths_start: usize = values_start + values_size as usize;
+        let values_size: usize = values_size.try_into().map_err(|_| Error::InvalidInput {
+            location: location!(),
+            source: format!("Invalid values buffer size: {}", values_size).into(),
+        })?;
+        let lengths_start = values_start.checked_add(values_size).ok_or_else(|| {
+            Error::InvalidInput {
+                location: location!(),
+                source: "Invalid RLE values buffer size".into(),
+            }
+        })?;
 
         if data.len() < lengths_start {
             return Err(Error::InvalidInput {
@@ -578,7 +604,7 @@ impl BlockDecompressor for RleDecompressor {
             });
         }
 
-        let values_buffer = data.slice_with_length(values_start, values_size as usize);
+        let values_buffer = data.slice_with_length(values_start, values_size);
         let lengths_buffer = data.slice_with_length(lengths_start, data.len() - lengths_start);
 
         self.decode_data(vec![values_buffer, lengths_buffer], num_values)
@@ -590,6 +616,7 @@ mod tests {
     use super::*;
     use crate::data::DataBlock;
     use crate::encodings::logical::primitive::miniblock::MAX_MINIBLOCK_VALUES;
+    use crate::{buffer::LanceBuffer, compression::BlockDecompressor};
     use arrow_array::Int32Array;
     // ========== Core Functionality Tests ==========
 
@@ -718,23 +745,31 @@ mod tests {
     // ========== Error Handling Tests ==========
 
     #[test]
-    #[should_panic(expected = "RLE decompressor expects exactly 2 buffers")]
     fn test_invalid_buffer_count() {
         let decompressor = RleDecompressor::new(32);
-        let _ = MiniBlockDecompressor::decompress(
+        let result = MiniBlockDecompressor::decompress(
             &decompressor,
             vec![LanceBuffer::from(vec![1, 2, 3, 4])],
             10,
         );
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("expects exactly 2 buffers"));
     }
 
     #[test]
-    #[should_panic(expected = "Inconsistent RLE buffers")]
     fn test_buffer_consistency() {
         let decompressor = RleDecompressor::new(32);
         let values = LanceBuffer::from(vec![1, 0, 0, 0]); // 1 i32 value
         let lengths = LanceBuffer::from(vec![5, 10]); // 2 lengths - mismatch!
-        let _ = MiniBlockDecompressor::decompress(&decompressor, vec![values, lengths], 15);
+        let result = MiniBlockDecompressor::decompress(&decompressor, vec![values, lengths], 15);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Inconsistent RLE buffers"));
     }
 
     #[test]
@@ -1119,6 +1154,20 @@ mod tests {
     }
 
     // ========== Block Related tests ==========
+    #[test]
+    fn test_block_decompressor_rejects_overflowing_values_size() {
+        let decompressor = RleDecompressor::new(32);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&u64::MAX.to_le_bytes());
+        let result = BlockDecompressor::decompress(&decompressor, LanceBuffer::from(data), 1);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid RLE values buffer size"));
+    }
+
     #[test]
     fn test_block_decompressor_too_small() {
         let decompressor = RleDecompressor::new(32);

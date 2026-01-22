@@ -139,7 +139,6 @@ pub struct DefaultCompressionStrategy {
     /// User-configured compression parameters
     params: CompressionParams,
     /// The lance file version for compatibilities.
-    // LanceFile Version
     version: LanceFileVersion,
 }
 
@@ -217,6 +216,7 @@ fn try_rle_for_mini_block(
 fn try_rle_for_block(
     data: &FixedWidthDataBlock,
     version: LanceFileVersion,
+    params: &CompressionFieldParams,
 ) -> Option<(Box<dyn BlockCompressor>, CompressiveEncoding)> {
     if version < LanceFileVersion::V2_2 {
         return None;
@@ -228,8 +228,9 @@ fn try_rle_for_block(
     }
 
     let run_count = data.expect_single_stat::<UInt64Type>(Stat::RunCount);
-    // TODO: Make this configurable
-    let threshold = DEFAULT_RLE_COMPRESSION_THRESHOLD;
+    let threshold = params
+        .rle_threshold
+        .unwrap_or(DEFAULT_RLE_COMPRESSION_THRESHOLD);
 
     if (run_count as f64) < (data.num_values as f64) * threshold {
         let compressor = Box::new(RleEncoder::new());
@@ -670,7 +671,9 @@ impl CompressionStrategy for DefaultCompressionStrategy {
 
         match data {
             DataBlock::FixedWidth(fixed_width) => {
-                if let Some((compressor, encoding)) = try_rle_for_block(fixed_width, self.version) {
+                if let Some((compressor, encoding)) =
+                    try_rle_for_block(fixed_width, self.version, &field_params)
+                {
                     return Ok((compressor, encoding));
                 }
                 if let Some((compressor, encoding)) = try_bitpack_for_block(fixed_width) {
@@ -822,7 +825,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(ValueDecompressor::from_fsl(fsl)))
             }
             Compression::Rle(rle) => {
-                let bits_per_value = validate_rle_compression(rle);
+                let bits_per_value = validate_rle_compression(rle)?;
                 Ok(Box::new(RleDecompressor::new(bits_per_value)))
             }
             Compression::ByteStreamSplit(bss) => {
@@ -1027,7 +1030,7 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
                 Ok(Box::new(general_decompressor))
             }
             Compression::Rle(rle) => {
-                let bits_per_value = validate_rle_compression(rle);
+                let bits_per_value = validate_rle_compression(rle)?;
                 Ok(Box::new(RleDecompressor::new(bits_per_value)))
             }
             _ => todo!(),
@@ -1035,26 +1038,45 @@ impl DecompressionStrategy for DefaultDecompressionStrategy {
     }
 }
 /// Validates RLE compression format and extracts bits_per_value
-fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> u64 {
-    let Compression::Flat(values) = rle.values.as_ref().unwrap().compression.as_ref().unwrap()
-    else {
-        panic!("RLE compression only supports flat values")
+fn validate_rle_compression(rle: &crate::format::pb21::Rle) -> Result<u64> {
+    let values = rle.values.as_ref().ok_or_else(|| {
+        Error::invalid_input("RLE compression missing values encoding", location!())
+    })?;
+    let run_lengths = rle.run_lengths.as_ref().ok_or_else(|| {
+        Error::invalid_input("RLE compression missing run lengths encoding", location!())
+    })?;
+
+    let values = values.compression.as_ref().ok_or_else(|| {
+        Error::invalid_input("RLE compression missing values compression", location!())
+    })?;
+    let Compression::Flat(values) = values else {
+        return Err(Error::invalid_input(
+            "RLE compression only supports flat values",
+            location!(),
+        ));
     };
-    let Compression::Flat(run_lengths) = rle
-        .run_lengths
-        .as_ref()
-        .unwrap()
-        .compression
-        .as_ref()
-        .unwrap()
-    else {
-        panic!("RLE compression only supports flat run lengths")
+
+    let run_lengths = run_lengths.compression.as_ref().ok_or_else(|| {
+        Error::invalid_input("RLE compression missing run lengths compression", location!())
+    })?;
+    let Compression::Flat(run_lengths) = run_lengths else {
+        return Err(Error::invalid_input(
+            "RLE compression only supports flat run lengths",
+            location!(),
+        ));
     };
-    assert_eq!(
-        run_lengths.bits_per_value, 8,
-        "RLE compression only supports 8-bit run lengths"
-    );
-    values.bits_per_value
+
+    if run_lengths.bits_per_value != 8 {
+        return Err(Error::invalid_input(
+            format!(
+                "RLE compression only supports 8-bit run lengths, got {}",
+                run_lengths.bits_per_value
+            ),
+            location!(),
+        ));
+    }
+
+    Ok(values.bits_per_value)
 }
 
 #[cfg(test)]
@@ -1704,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rle_block_not_used_for_version_larger_than_v2_1() {
+    fn test_rle_block_used_for_version_v2_2() {
         let field = create_test_field("test_repdef", DataType::UInt16);
 
         // Create highly repetitive data
@@ -1739,7 +1761,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rle_block_not_used_for_version_less_than_v2_2() {
+    fn test_rle_block_not_used_for_version_v2_1() {
         let field = create_test_field("test_repdef", DataType::UInt16);
 
         // Create highly repetitive data
