@@ -2782,7 +2782,7 @@ checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "fsst"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow-array",
  "rand 0.9.2",
@@ -3854,7 +3854,7 @@ dependencies = [
 
 [[package]]
 name = "lance"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -3919,7 +3919,7 @@ dependencies = [
 
 [[package]]
 name = "lance-arrow"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3937,7 +3937,7 @@ dependencies = [
 
 [[package]]
 name = "lance-bitpacking"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrayref",
  "paste",
@@ -3946,7 +3946,7 @@ dependencies = [
 
 [[package]]
 name = "lance-core"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -3982,7 +3982,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datafusion"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4013,7 +4013,7 @@ dependencies = [
 
 [[package]]
 name = "lance-datagen"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -4030,7 +4030,7 @@ dependencies = [
 
 [[package]]
 name = "lance-encoding"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4067,7 +4067,7 @@ dependencies = [
 
 [[package]]
 name = "lance-file"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow-arith",
  "arrow-array",
@@ -4099,7 +4099,7 @@ dependencies = [
 
 [[package]]
 name = "lance-geo"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "datafusion",
  "geo-types",
@@ -4110,7 +4110,7 @@ dependencies = [
 
 [[package]]
 name = "lance-index"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4174,7 +4174,7 @@ dependencies = [
 
 [[package]]
 name = "lance-io"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow",
  "arrow-arith",
@@ -4214,7 +4214,7 @@ dependencies = [
 
 [[package]]
 name = "lance-linalg"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -4230,7 +4230,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4242,7 +4242,7 @@ dependencies = [
 
 [[package]]
 name = "lance-namespace-impls"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow",
  "arrow-ipc",
@@ -4285,7 +4285,7 @@ dependencies = [
 
 [[package]]
 name = "lance-table"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow",
  "arrow-array",
@@ -5098,9 +5098,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "oneshot"
-version = "0.1.12"
+version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ce66197e99546da6c6d991285f605192e794ceae69686c17163844a7bf8fcc2"
+checksum = "269bca4c2591a28585d6bf10d9ed0332b7d76900a1b02bec41bdc3a2cdcda107"
 
 [[package]]
 name = "opendal"
@@ -5659,7 +5659,7 @@ dependencies = [
 
 [[package]]
 name = "pylance"
-version = "1.0.4-rc.1"
+version = "1.0.4"
 dependencies = [
  "arrow",
  "arrow-array",
