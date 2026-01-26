@@ -68,24 +68,7 @@ impl ScalarQuantizer {
         &mut self,
         vectors: &FixedSizeListArray,
     ) -> Result<Range<f64>> {
-        let data = vectors
-            .values()
-            .as_any()
-            .downcast_ref::<T::ArrayType>()
-            .ok_or(Error::Index {
-                message: format!(
-                    "Expect to be a float vector array, got: {:?}",
-                    vectors.value_type()
-                ),
-                location: location!(),
-            })?
-            .as_slice();
-
-        self.metadata.bounds = data.iter().fold(self.metadata.bounds.clone(), |f, v| {
-            f.start.min(v.as_())..f.end.max(v.as_())
-        });
-
-        Ok(self.metadata.bounds.clone())
+        self.update_bounds_with_clip::<T>(vectors, 0.0)
     }
 
     fn update_bounds_with_clip<T: ArrowFloatType>(
@@ -107,14 +90,25 @@ impl ScalarQuantizer {
             .as_slice();
 
         if data.is_empty() {
-            return Err(Error::invalid_input(
-                "SQ builder: empty training data".to_string(),
-                location!(),
-            ));
+            return Ok(self.metadata.bounds.clone());
+        }
+
+        if clip <= 0.0 {
+            self.metadata.bounds = data.iter().fold(self.metadata.bounds.clone(), |f, v| {
+                f.start.min(v.as_())..f.end.max(v.as_())
+            });
+            return Ok(self.metadata.bounds.clone());
+        }
+
+        let clip_count = ((data.len() as f64) * (clip / 100.0)).floor() as usize;
+        if clip_count == 0 {
+            self.metadata.bounds = data.iter().fold(self.metadata.bounds.clone(), |f, v| {
+                f.start.min(v.as_())..f.end.max(v.as_())
+            });
+            return Ok(self.metadata.bounds.clone());
         }
 
         let mut values: Vec<f64> = data.iter().map(|v| v.as_()).collect();
-        let clip_count = ((values.len() as f64) * (clip / 100.0)).floor() as usize;
         let lower_index = clip_count;
         let upper_index = values.len() - 1 - clip_count;
 
@@ -434,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn test_sq_build_with_clip() {
         let float_values = Vec::from_iter((0..1000).map(|v| v as f64));
-        let float_array = Float64Array::from_iter_values(float_values.clone());
+        let float_array = Float64Array::from_iter_values(float_values);
         let vectors = FixedSizeListArray::try_new_from_values(float_array, 1).unwrap();
         let params = SQBuildParams {
             clip: 0.5,

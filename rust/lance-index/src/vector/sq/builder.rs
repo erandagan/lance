@@ -20,7 +20,7 @@ impl Default for SQBuildParams {
         Self {
             num_bits: 8,
             sample_rate: 256,
-            clip: 0.5,
+            clip: 0.05,
         }
     }
 }

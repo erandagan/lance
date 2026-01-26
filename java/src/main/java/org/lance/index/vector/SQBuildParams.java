@@ -30,7 +30,7 @@ public class SQBuildParams {
   public static class Builder {
     private short numBits = 8;
     private int sampleRate = 256;
-    private double clip = 0.5;
+    private double clip = 0.05;
 
     public Builder() {}
 
