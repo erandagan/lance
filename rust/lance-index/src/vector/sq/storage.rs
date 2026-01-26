@@ -42,6 +42,8 @@ pub struct ScalarQuantizationMetadata {
     pub dim: usize,
     pub num_bits: u16,
     pub bounds: Range<f64>,
+    #[serde(default)]
+    pub clip: f64,
 }
 
 impl DeepSizeOf for ScalarQuantizationMetadata {

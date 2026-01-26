@@ -50,6 +50,7 @@ impl ScalarQuantizer {
                     start: f64::MAX,
                     end: f64::MIN,
                 },
+                clip: 0.0,
             },
         }
     }
@@ -69,6 +70,13 @@ impl ScalarQuantizer {
         vectors: &FixedSizeListArray,
         clip: f64,
     ) -> Result<Range<f64>> {
+        if !(0.0..50.0).contains(&clip) {
+            return Err(Error::invalid_input(
+                format!("SQ builder: clip must be in [0, 50), got {}", clip),
+                location!(),
+            ));
+        }
+
         let data = vectors
             .values()
             .as_any()
@@ -101,16 +109,21 @@ impl ScalarQuantizer {
             return Ok(self.metadata.bounds.clone());
         }
 
-        let mut values: Vec<f64> = data.iter().map(|v| v.as_()).collect();
         let lower_index = clip_count;
-        let upper_index = values.len() - 1 - clip_count;
-
-        let (_, lower, _) =
-            values.select_nth_unstable_by(lower_index, |a, b| a.total_cmp(b));
-        let lower = *lower;
-        let (_, upper, _) =
-            values.select_nth_unstable_by(upper_index, |a, b| a.total_cmp(b));
-        let upper = *upper;
+        let upper_index = data.len() - 1 - clip_count;
+        let mut indices: Vec<usize> = (0..data.len()).collect();
+        let (_, lower, _) = indices.select_nth_unstable_by(lower_index, |&a, &b| {
+            let a_val: f64 = data[a].as_();
+            let b_val: f64 = data[b].as_();
+            a_val.total_cmp(&b_val)
+        });
+        let lower: f64 = data[*lower].as_();
+        let (_, upper, _) = indices.select_nth_unstable_by(upper_index, |&a, &b| {
+            let a_val: f64 = data[a].as_();
+            let b_val: f64 = data[b].as_();
+            a_val.total_cmp(&b_val)
+        });
+        let upper: f64 = data[*upper].as_();
 
         self.metadata.bounds = lower..upper;
         Ok(self.metadata.bounds.clone())
@@ -153,6 +166,10 @@ impl ScalarQuantizer {
         self.metadata.bounds.clone()
     }
 
+    pub fn clip(&self) -> f64 {
+        self.metadata.clip
+    }
+
     /// Whether to use residual as input or not.
     pub fn use_residual(&self) -> bool {
         false
@@ -187,6 +204,7 @@ impl Quantization for ScalarQuantizer {
         })?;
 
         let mut quantizer = Self::new(params.num_bits, fsl.value_length() as usize);
+        quantizer.metadata.clip = params.clip;
         if !(0.0..50.0).contains(&params.clip) {
             return Err(Error::invalid_input(
                 format!(
@@ -228,13 +246,13 @@ impl Quantization for ScalarQuantizer {
 
         match fsl.value_type() {
             DataType::Float16 => {
-                self.update_bounds::<Float16Type>(fsl, 0.0)?;
+                self.update_bounds::<Float16Type>(fsl, self.metadata.clip)?;
             }
             DataType::Float32 => {
-                self.update_bounds::<Float32Type>(fsl, 0.0)?;
+                self.update_bounds::<Float32Type>(fsl, self.metadata.clip)?;
             }
             DataType::Float64 => {
-                self.update_bounds::<Float64Type>(fsl, 0.0)?;
+                self.update_bounds::<Float64Type>(fsl, self.metadata.clip)?;
             }
             value_type => {
                 return Err(Error::invalid_input(
