@@ -168,7 +168,10 @@ impl ScalarQuantizer {
             (Some(lower), Some(upper)) => lower..upper,
             _ => {
                 return Err(Error::invalid_input(
-                    "SQ builder: too few values to compute bounds",
+                    format!(
+                        "SQ builder: too few values to compute bounds: clip={:.2}%, num_rows={}",
+                        clip, num_rows
+                    ),
                     location!(),
                 ));
             }
