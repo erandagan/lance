@@ -33,7 +33,7 @@ use datafusion::{
 };
 use datafusion_physical_expr::{Distribution, EquivalenceProperties};
 use datafusion_physical_plan::metrics::{BaselineMetrics, Count};
-use futures::{future, stream, Stream, StreamExt, TryFutureExt, TryStreamExt};
+use futures::{future, stream, StreamExt, TryFutureExt, TryStreamExt};
 use itertools::Itertools;
 use lance_core::utils::futures::FinallyStreamExt;
 use lance_core::ROW_ID;
@@ -43,10 +43,12 @@ use lance_datafusion::utils::{
     PARTITIONS_SEARCHED_METRIC,
 };
 use lance_index::prefilter::PreFilter;
+use lance_index::vector::quantizer::Quantizer;
 use lance_index::vector::{
     flat::compute_distance, Query, DIST_COL, INDEX_UUID_COLUMN, PART_ID_COLUMN,
 };
 use lance_index::vector::{VectorIndex, DIST_Q_C_COLUMN};
+use lance_index::IndexType;
 use lance_linalg::distance::DistanceType;
 use lance_linalg::kernels::normalize_arrow;
 use lance_table::format::IndexMetadata;
@@ -728,6 +730,32 @@ impl ANNIvfEarlySearchResults {
 }
 
 impl ANNIvfSubIndexExec {
+    fn prepare_query_for_index(
+        mut query: Query,
+        index: &dyn VectorIndex,
+    ) -> DataFusionResult<Query> {
+        if index.metric_type() == DistanceType::Cosine {
+            let key = normalize_arrow(&query.key)
+                .map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to normalize query: {}", e))
+                })?
+                .0;
+            query.key = key;
+        }
+
+        query.rabit_rotated_key = None;
+        if index.index_type() == IndexType::IvfRq {
+            if let Quantizer::Rabit(rq) = index.quantizer() {
+                let rotated = rq.rotate_vector(query.key.as_ref()).map_err(|e| {
+                    DataFusionError::Execution(format!("Failed to rotate query: {}", e))
+                })?;
+                query.rabit_rotated_key = Some(rotated as ArrayRef);
+            }
+        }
+
+        Ok(query)
+    }
+
     fn late_search(
         index: Arc<dyn VectorIndex>,
         query: Query,
@@ -736,8 +764,13 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
-    ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+    ) -> futures::stream::BoxStream<'static, DataFusionResult<RecordBatch>> {
         let stream = futures::stream::once(async move {
+            let query = match Self::prepare_query_for_index(query, index.as_ref()) {
+                Ok(q) => q,
+                Err(e) => return futures::stream::once(async move { Err(e) }).boxed(),
+            };
+
             let max_nprobes = query
                 .maximum_nprobes
                 .unwrap_or(partitions.len())
@@ -816,12 +849,6 @@ impl ANNIvfSubIndexExec {
                     let state = state.clone();
                     let index = index.clone();
                     async move {
-                        let mut query = query.clone();
-                        if index.metric_type() == DistanceType::Cosine {
-                            let key = normalize_arrow(&query.key)?.0;
-                            query.key = key;
-                        };
-
                         metrics.partitions_searched.add(1);
                         let batch = index
                             .search_in_partition(
@@ -849,7 +876,7 @@ impl ANNIvfSubIndexExec {
                 .buffered(get_num_compute_intensive_cpus())
                 .boxed()
         });
-        stream.flatten()
+        stream.flatten().boxed()
     }
 
     fn initial_search(
@@ -860,7 +887,12 @@ impl ANNIvfSubIndexExec {
         prefilter: Arc<DatasetPreFilter>,
         metrics: Arc<AnnIndexMetrics>,
         state: Arc<ANNIvfEarlySearchResults>,
-    ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
+    ) -> futures::stream::BoxStream<'static, DataFusionResult<RecordBatch>> {
+        let query = match Self::prepare_query_for_index(query, index.as_ref()) {
+            Ok(q) => q,
+            Err(e) => return futures::stream::once(async move { Err(e) }).boxed(),
+        };
+
         let minimum_nprobes = query.minimum_nprobes.min(partitions.len());
         metrics.partitions_searched.add(minimum_nprobes);
 
@@ -874,12 +906,6 @@ impl ANNIvfSubIndexExec {
                 let pre_filter = prefilter.clone();
                 let state = state.clone();
                 async move {
-                    let mut query = query.clone();
-                    if index.metric_type() == DistanceType::Cosine {
-                        let key = normalize_arrow(&query.key)?.0;
-                        query.key = key;
-                    };
-
                     let batch = index
                         .search_in_partition(
                             part_id as usize,
@@ -897,6 +923,7 @@ impl ANNIvfSubIndexExec {
                 }
             })
             .buffered(get_num_compute_intensive_cpus())
+            .boxed()
     }
 }
 
@@ -1385,6 +1412,7 @@ mod tests {
             metric_type: Some(DistanceType::L2),
             use_index: true,
             dist_q_c: 0.0,
+            rabit_rotated_key: None,
         }
     }
 
@@ -1562,6 +1590,7 @@ mod tests {
             metric_type: Some(DistanceType::Cosine),
             use_index: true,
             dist_q_c: 0.0,
+            rabit_rotated_key: None,
         };
 
         async fn multivector_scoring(

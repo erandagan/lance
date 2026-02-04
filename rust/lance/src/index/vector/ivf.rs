@@ -1591,6 +1591,7 @@ pub(crate) async fn remap_index_file(
 
     let mut ivf = IvfModel {
         centroids: index.ivf.centroids.clone(),
+        rotated_centroids: index.ivf.rotated_centroids.clone(),
         offsets: Vec::with_capacity(index.ivf.offsets.len()),
         lengths: Vec::with_capacity(index.ivf.lengths.len()),
         loss: index.ivf.loss,
@@ -2426,6 +2427,7 @@ mod tests {
                     metric_type: Some(MetricType::L2),
                     use_index: true,
                     dist_q_c: 0.0,
+                    rabit_rotated_key: None,
                 };
                 let (partitions, _) = index.find_partitions(&query).unwrap();
                 let nearest_partition_id = partitions.value(0) as usize;

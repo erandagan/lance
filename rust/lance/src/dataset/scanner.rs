@@ -1259,6 +1259,7 @@ impl Scanner {
             metric_type: None,
             use_index: true,
             dist_q_c: 0.0,
+            rabit_rotated_key: None,
         });
         Ok(self)
     }

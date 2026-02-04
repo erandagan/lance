@@ -40,7 +40,7 @@ use crate::{
     vector::{
         pq::transform::PQTransformer,
         quantizer::{QuantizerMetadata, QuantizerStorage},
-        storage::{DistCalculator, VectorStore},
+        storage::{DistCalculator, IvfPartitionCentroid, VectorStore},
         transform::Transformer,
         PQ_CODE_COLUMN,
     },
@@ -840,6 +840,8 @@ impl VectorStore for ProductQuantizationStorage {
         }
     }
 }
+
+impl IvfPartitionCentroid for ProductQuantizationStorage {}
 
 /// Distance calculator backed by PQ code.
 pub struct PQDistCalculator {

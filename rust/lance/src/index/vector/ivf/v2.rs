@@ -34,7 +34,7 @@ use lance_index::vector::ivf::storage::IvfModel;
 use lance_index::vector::pq::ProductQuantizer;
 use lance_index::vector::quantizer::{QuantizationType, Quantizer};
 use lance_index::vector::sq::ScalarQuantizer;
-use lance_index::vector::storage::VectorStore;
+use lance_index::vector::storage::{IvfPartitionCentroid, VectorStore};
 use lance_index::vector::v3::subindex::SubIndexType;
 use lance_index::vector::VectorIndexCacheEntry;
 use lance_index::{
@@ -287,7 +287,11 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     self.sub_index_metadata[partition_id].clone(),
                 )?;
                 let idx = S::load(batch)?;
-                let storage = self.load_partition_storage(partition_id).await?;
+                let mut storage = self.load_partition_storage(partition_id).await?;
+                if let Some(centroid) = self.ivf.centroid(partition_id) {
+                    let rotated_centroid = self.ivf.rotated_centroid(partition_id);
+                    storage.set_ivf_centroid(centroid, rotated_centroid)?;
+                }
                 let partition_entry = Arc::new(PartitionEntry::<S, Q> {
                     index: idx,
                     storage,
@@ -315,6 +319,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     #[instrument(level = "debug", skip(self))]
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
         if Q::use_residual(self.distance_type) {
+            if Q::quantization_type() == QuantizationType::Rabit {
+                if let Some(rotated) = query.rabit_rotated_key.as_ref() {
+                    let mut part_query = query.clone();
+                    part_query.key = rotated.clone();
+                    return Ok(part_query);
+                }
+            }
             let partition_centroids =
                 self.ivf
                     .centroid(partition_id)

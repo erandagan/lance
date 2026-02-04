@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type};
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, UInt8Array};
+use arrow_array::{Array, ArrayRef, FixedSizeListArray, Float32Array, UInt8Array};
 use arrow_schema::{DataType, Field};
 use bitvec::prelude::{BitVec, Lsb0};
 use deepsize::DeepSizeOf;
 use lance_arrow::{ArrowFloatType, FixedSizeListArrayExt, FloatArray, FloatType};
 use lance_core::{Error, Result};
+use lance_linalg::distance::Dot;
 use ndarray::{s, Axis};
 use num_traits::{AsPrimitive, FromPrimitive};
 use rand_distr::Distribution;
@@ -75,6 +76,66 @@ impl RabitQuantizer {
 
     pub fn num_bits(&self) -> u8 {
         self.metadata.num_bits
+    }
+
+    /// Rotate a query / centroid vector by the Rabit rotation matrix.
+    ///
+    /// This returns `q * R` as a `Float32Array` of length `code_dim`.
+    pub fn rotate_vector(&self, v: &dyn Array) -> Result<Arc<Float32Array>> {
+        let rotate_mat = self.metadata.rotate_mat.as_ref().ok_or(Error::Index {
+            message: "Rabit rotation matrix not loaded".to_string(),
+            location: location!(),
+        })?;
+
+        match rotate_mat.value_type() {
+            DataType::Float16 => Self::rotate_vector_impl::<Float16Type>(rotate_mat, v),
+            DataType::Float32 => Self::rotate_vector_impl::<Float32Type>(rotate_mat, v),
+            DataType::Float64 => Self::rotate_vector_impl::<Float64Type>(rotate_mat, v),
+            dt => Err(Error::invalid_input(
+                format!("RabitQ does not support data type: {}", dt),
+                location!(),
+            )),
+        }
+    }
+
+    fn rotate_vector_impl<T: ArrowFloatType>(
+        rotate_mat: &FixedSizeListArray,
+        v: &dyn Array,
+    ) -> Result<Arc<Float32Array>>
+    where
+        T::Native: Dot,
+    {
+        let d = v.len();
+        let code_dim = rotate_mat.len();
+
+        let rotate_mat = rotate_mat
+            .values()
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .unwrap()
+            .as_slice();
+
+        let v = v
+            .as_any()
+            .downcast_ref::<T::ArrayType>()
+            .ok_or_else(|| {
+                Error::invalid_input(
+                    format!(
+                        "Rabit rotate_vector: vector type mismatch, expected {}, got {}",
+                        T::FLOAT_TYPE,
+                        v.data_type()
+                    ),
+                    location!(),
+                )
+            })?
+            .as_slice();
+
+        let rotated: Vec<f32> = rotate_mat
+            .chunks_exact(code_dim)
+            .map(|chunk| lance_linalg::distance::dot(&chunk[..d], v))
+            .collect();
+
+        Ok(Arc::new(Float32Array::from(rotated)))
     }
 
     #[inline]

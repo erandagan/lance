@@ -31,6 +31,20 @@ use crate::{
 use super::quantizer::{Quantizer, QuantizerMetadata};
 use super::DISTANCE_TYPE_KEY;
 
+/// Hook to attach IVF partition context to a loaded quantization storage.
+///
+/// This is primarily used by IVF_RQ to cache per-partition precomputed `c * R`
+/// (rotated centroids) so query-time can use `q * R - c * R`.
+pub trait IvfPartitionCentroid {
+    fn set_ivf_centroid(
+        &mut self,
+        _centroid: ArrayRef,
+        _rotated_centroid: Option<ArrayRef>,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// <section class="warning">
 ///  Internal API
 ///

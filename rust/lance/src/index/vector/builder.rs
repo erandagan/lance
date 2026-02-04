@@ -1147,6 +1147,26 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
             }
         }
 
+        if Q::quantization_type() == QuantizationType::Rabit {
+            let quantizer_enum: lance_index::vector::quantizer::Quantizer =
+                quantizer.clone().into();
+            if let lance_index::vector::quantizer::Quantizer::Rabit(rq) = quantizer_enum {
+                if let Some(centroids) = index_ivf.centroids.as_ref() {
+                    let code_dim = rq.code_dim();
+                    let mut rotated_values = Vec::with_capacity(centroids.len() * code_dim);
+                    for part_id in 0..centroids.len() {
+                        let centroid = centroids.value(part_id);
+                        let rotated = rq.rotate_vector(centroid.as_ref())?;
+                        rotated_values.extend_from_slice(rotated.values());
+                    }
+                    index_ivf.rotated_centroids = Some(FixedSizeListArray::try_new_from_values(
+                        arrow_array::Float32Array::from(rotated_values),
+                        code_dim as i32,
+                    )?);
+                }
+            }
+        }
+
         let storage_ivf_pb = pb::Ivf::try_from(&storage_ivf)?;
         storage_writer.add_schema_metadata(DISTANCE_TYPE_KEY, self.distance_type.to_string());
         let ivf_buffer_pos = storage_writer

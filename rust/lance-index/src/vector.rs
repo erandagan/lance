@@ -116,6 +116,12 @@ pub struct Query {
     /// the distance between the query and the centroid
     /// this is only used for IVF index with Rabit quantization
     pub dist_q_c: f32,
+
+    /// Pre-rotated query vector for Rabit quantization.
+    ///
+    /// When present, IVF_RQ query-time can avoid per-partition rotation by using:
+    /// `(q - c) * R = q * R - c * R`.
+    pub rabit_rotated_key: Option<ArrayRef>,
 }
 
 impl From<pb::VectorMetricType> for DistanceType {

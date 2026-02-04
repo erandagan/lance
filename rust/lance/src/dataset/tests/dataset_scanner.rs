@@ -58,6 +58,7 @@ async fn test_vector_filter_fts_search() {
         metric_type: Some(MetricType::L2),
         use_index: true,
         dist_q_c: 0.0,
+        rabit_rotated_key: None,
     };
 
     // Case 1: search with prefilter=true, query_filter=vector([300,300,300,300])

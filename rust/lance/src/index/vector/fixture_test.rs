@@ -267,6 +267,7 @@ mod test {
                 metric_type: Some(metric),
                 use_index: true,
                 dist_q_c: 0.0,
+                rabit_rotated_key: None,
             };
             let idx = make_idx.clone()(expected_query_at_subindex, metric).await;
             let (partition_ids, _) = idx.find_partitions(&q).unwrap();

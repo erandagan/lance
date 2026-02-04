@@ -28,7 +28,7 @@ use crate::frag_reuse::FragReuseIndex;
 use crate::{
     vector::{
         quantizer::{QuantizerMetadata, QuantizerStorage},
-        storage::{DistCalculator, VectorStore},
+        storage::{DistCalculator, IvfPartitionCentroid, VectorStore},
         transform::Transformer,
         SQ_CODE_COLUMN,
     },
@@ -395,6 +395,8 @@ impl VectorStore for ScalarQuantizationStorage {
         }
     }
 }
+
+impl IvfPartitionCentroid for ScalarQuantizationStorage {}
 
 #[inline]
 fn sq_distance_scale(bounds: &Range<f64>) -> f32 {

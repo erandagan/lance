@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::index::FlatMetadata;
 use crate::frag_reuse::FragReuseIndex;
 use crate::vector::quantizer::QuantizerStorage;
+use crate::vector::storage::IvfPartitionCentroid;
 use crate::vector::storage::{DistCalculator, VectorStore};
 use crate::vector::utils::do_prefetch;
 use arrow::array::AsArray;
@@ -184,6 +185,8 @@ impl VectorStore for FlatFloatStorage {
     }
 }
 
+impl IvfPartitionCentroid for FlatFloatStorage {}
+
 /// All data are stored in memory
 #[derive(Debug, Clone)]
 pub struct FlatBinStorage {
@@ -341,6 +344,8 @@ impl VectorStore for FlatBinStorage {
         )
     }
 }
+
+impl IvfPartitionCentroid for FlatBinStorage {}
 
 pub struct FlatDistanceCal<'a, T: ArrowPrimitiveType> {
     vectors: &'a [T::Native],

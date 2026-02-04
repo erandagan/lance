@@ -23,7 +23,11 @@ use snafu::location;
 
 use super::flat::index::{FlatBinQuantizer, FlatQuantizer};
 use super::pq::ProductQuantizer;
-use super::{ivf::storage::IvfModel, sq::ScalarQuantizer, storage::VectorStore};
+use super::{
+    ivf::storage::IvfModel,
+    sq::ScalarQuantizer,
+    storage::{IvfPartitionCentroid, VectorStore},
+};
 use crate::frag_reuse::FragReuseIndex;
 use crate::vector::bq::builder::RabitQuantizer;
 use crate::{IndexMetadata, INDEX_METADATA_SCHEMA_KEY};
@@ -39,7 +43,7 @@ pub trait Quantization:
 {
     type BuildParams: QuantizerBuildParams + Send + Sync;
     type Metadata: QuantizerMetadata + Send + Sync;
-    type Storage: QuantizerStorage<Metadata = Self::Metadata> + Debug;
+    type Storage: QuantizerStorage<Metadata = Self::Metadata> + IvfPartitionCentroid + Debug;
 
     fn build(
         data: &dyn Array,

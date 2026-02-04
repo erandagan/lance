@@ -71,6 +71,11 @@ message IVF {
 
   // KMeans loss.
   optional double loss = 5;
+
+  // Tensor of rotated centroids. `num_partitions * code_dim` of float32s.
+  //
+  // This is used by IVF_RQ to avoid computing (centroid * R) at query time.
+  Tensor rotated_centroids_tensor = 6;
 }
 
 // Product Quantization.

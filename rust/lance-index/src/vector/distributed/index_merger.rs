@@ -1329,6 +1329,7 @@ mod tests {
             lengths: lengths.to_vec(),
             centroids_tensor: None,
             loss: None,
+            rotated_centroids_tensor: None,
         };
         let buf = Bytes::from(ivf_meta.encode_to_vec());
         let pos = v2w.add_global_buffer(buf).await?;
@@ -1567,6 +1568,7 @@ mod tests {
             lengths: lengths.to_vec(),
             centroids_tensor: None,
             loss: None,
+            rotated_centroids_tensor: None,
         };
         let buf = Bytes::from(ivf_meta.encode_to_vec());
         let ivf_pos = v2w.add_global_buffer(buf).await?;

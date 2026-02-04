@@ -7,7 +7,8 @@ use std::sync::Arc;
 use arrow::array::AsArray;
 use arrow::datatypes::{Float16Type, Float32Type, Float64Type, UInt64Type, UInt8Type};
 use arrow_array::{
-    Array, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array, UInt64Array, UInt8Array,
+    Array, ArrayRef, FixedSizeListArray, Float32Array, RecordBatch, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use arrow_schema::{DataType, SchemaRef};
 use async_trait::async_trait;
@@ -31,6 +32,7 @@ use crate::pb;
 use crate::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
 use crate::vector::pq::storage::transpose;
 use crate::vector::quantizer::{QuantizerMetadata, QuantizerStorage};
+use crate::vector::storage::IvfPartitionCentroid;
 use crate::vector::storage::{DistCalculator, VectorStore};
 
 pub const RABIT_METADATA_KEY: &str = "lance:rabit";
@@ -118,11 +120,20 @@ pub struct RabitQuantizationStorage {
     codes: FixedSizeListArray,
     add_factors: Float32Array,
     scale_factors: Float32Array,
+
+    // Optional per-partition precomputed rotated IVF centroid (c * R), cached at load time.
+    rotated_centroid: Option<Arc<Vec<f32>>>,
 }
 
 impl DeepSizeOf for RabitQuantizationStorage {
     fn deep_size_of_children(&self, context: &mut deepsize::Context) -> usize {
-        self.metadata.deep_size_of_children(context) + self.batch.get_array_memory_size()
+        self.metadata.deep_size_of_children(context)
+            + self.batch.get_array_memory_size()
+            + self
+                .rotated_centroid
+                .as_ref()
+                .map(|c| c.len() * std::mem::size_of::<f32>())
+                .unwrap_or(0)
     }
 }
 
@@ -413,12 +424,36 @@ impl VectorStore for RabitQuantizationStorage {
             .rotate_mat
             .as_ref()
             .expect("RabitQ metadata not loaded");
+        let code_dim = rotate_mat.len();
+        let dim = code_dim / self.metadata.num_bits as usize;
 
-        let rotated_qr = match rotate_mat.value_type() {
-            DataType::Float16 => Self::rotate_query_vector::<Float16Type>(rotate_mat, &qr),
-            DataType::Float32 => Self::rotate_query_vector::<Float32Type>(rotate_mat, &qr),
-            DataType::Float64 => Self::rotate_query_vector::<Float64Type>(rotate_mat, &qr),
-            dt => unimplemented!("RabitQ does not support data type: {}", dt),
+        let rotated_qr = match (self.rotated_centroid.as_ref(), qr.len() == code_dim) {
+            (Some(c_r), true) => {
+                // Fast path: query is already rotated (q * R) and we have c * R cached
+                let q_r = qr
+                    .as_any()
+                    .downcast_ref::<Float32Array>()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "RabitQ fast path requires Float32Array query, got {}",
+                            qr.data_type()
+                        )
+                    });
+                q_r.values()
+                    .iter()
+                    .zip(c_r.iter())
+                    .map(|(qv, cv)| qv - cv)
+                    .collect::<Vec<f32>>()
+            }
+            _ => {
+                // Slow path (legacy): query is residual (q - c), rotate it per partition
+                match rotate_mat.value_type() {
+                    DataType::Float16 => Self::rotate_query_vector::<Float16Type>(rotate_mat, &qr),
+                    DataType::Float32 => Self::rotate_query_vector::<Float32Type>(rotate_mat, &qr),
+                    DataType::Float64 => Self::rotate_query_vector::<Float64Type>(rotate_mat, &qr),
+                    dt => unimplemented!("RabitQ does not support data type: {}", dt),
+                }
+            }
         };
 
         let dist_table = build_dist_table_direct::<Float32Type>(&rotated_qr);
@@ -433,7 +468,7 @@ impl VectorStore for RabitQuantizationStorage {
             ),
         };
         RabitDistCalculator::new(
-            qr.len(),
+            dim,
             self.metadata.num_bits,
             dist_table,
             sum_q,
@@ -448,6 +483,67 @@ impl VectorStore for RabitQuantizationStorage {
     // This method is required for HNSW, we can't support HNSW_RABIT before this is implemented
     fn dist_calculator_from_id(&self, _: u32) -> Self::DistanceCalculator<'_> {
         unimplemented!("RabitQ does not support dist_calculator_from_id")
+    }
+}
+
+impl IvfPartitionCentroid for RabitQuantizationStorage {
+    fn set_ivf_centroid(
+        &mut self,
+        centroid: ArrayRef,
+        rotated_centroid: Option<ArrayRef>,
+    ) -> Result<()> {
+        let rotate_mat = self.metadata.rotate_mat.as_ref().ok_or(Error::Index {
+            message: "RabitQ metadata not loaded".to_string(),
+            location: location!(),
+        })?;
+        let code_dim = rotate_mat.len();
+
+        let rotated = if let Some(rotated_centroid) = rotated_centroid {
+            let arr = rotated_centroid
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| {
+                    Error::invalid_input(
+                        format!(
+                            "rotated centroid must be Float32Array, got {}",
+                            rotated_centroid.data_type()
+                        ),
+                        location!(),
+                    )
+                })?;
+            if arr.len() != code_dim {
+                return Err(Error::invalid_input(
+                    format!(
+                        "rotated centroid length mismatch: {} != {}",
+                        arr.len(),
+                        code_dim
+                    ),
+                    location!(),
+                ));
+            }
+            arr.values().to_vec()
+        } else {
+            match rotate_mat.value_type() {
+                DataType::Float16 => {
+                    Self::rotate_query_vector::<Float16Type>(rotate_mat, centroid.as_ref())
+                }
+                DataType::Float32 => {
+                    Self::rotate_query_vector::<Float32Type>(rotate_mat, centroid.as_ref())
+                }
+                DataType::Float64 => {
+                    Self::rotate_query_vector::<Float64Type>(rotate_mat, centroid.as_ref())
+                }
+                dt => {
+                    return Err(Error::invalid_input(
+                        format!("RabitQ does not support data type: {}", dt),
+                        location!(),
+                    ))
+                }
+            }
+        };
+
+        self.rotated_centroid = Some(Arc::new(rotated));
+        Ok(())
     }
 }
 
@@ -639,6 +735,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             codes,
             add_factors,
             scale_factors,
+            rotated_centroid: None,
         })
     }
 
@@ -707,6 +804,7 @@ impl QuantizerStorage for RabitQuantizationStorage {
             add_factors: self.add_factors.clone(),
             scale_factors: self.scale_factors.clone(),
             row_ids: new_row_ids,
+            rotated_centroid: self.rotated_centroid.clone(),
         })
     }
 }
@@ -760,6 +858,13 @@ fn get_rq_code(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vector::bq::builder::RabitQuantizer;
+    use crate::vector::bq::transform::{ADD_FACTORS_COLUMN, SCALE_FACTORS_COLUMN};
+    use crate::vector::quantizer::Quantization;
+    use crate::vector::storage::IvfPartitionCentroid;
+    use arrow_array::types::Float32Type;
+    use arrow_array::ArrayRef;
+    use arrow_schema::{Field, Schema};
 
     fn build_dist_table_not_optimized<T: ArrowFloatType>(
         sub_vec: &[T::Native],
@@ -822,6 +927,93 @@ mod tests {
                 "Mismatch for num_vectors={}",
                 num_vectors
             );
+        }
+    }
+
+    #[test]
+    fn test_rabit_fast_path_matches_slow_path() {
+        const DIM: usize = 32;
+        const NUM_BITS: u8 = 1;
+        const TOTAL: usize = 64;
+
+        let rq = RabitQuantizer::new::<Float32Type>(NUM_BITS, DIM as i32);
+        let metadata = rq.metadata(None);
+
+        let code_len = DIM * NUM_BITS as usize / u8::BITS as usize;
+        let mut codes_data = Vec::with_capacity(TOTAL * code_len);
+        for i in 0..TOTAL {
+            for j in 0..code_len {
+                codes_data.push(((i * 31 + j * 7) & 0xFF) as u8);
+            }
+        }
+
+        let row_ids = UInt64Array::from_iter_values(0..TOTAL as u64);
+        let codes =
+            FixedSizeListArray::try_new_from_values(UInt8Array::from(codes_data), code_len as i32)
+                .unwrap();
+        let add_factors = Float32Array::from_value(0.0, TOTAL);
+        let scale_factors = Float32Array::from_value(1.0, TOTAL);
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(ROW_ID, DataType::UInt64, false),
+            Field::new(
+                RABIT_CODE_COLUMN,
+                DataType::FixedSizeList(
+                    Arc::new(Field::new("item", DataType::UInt8, true)),
+                    code_len as i32,
+                ),
+                true,
+            ),
+            Field::new(ADD_FACTORS_COLUMN, DataType::Float32, true),
+            Field::new(SCALE_FACTORS_COLUMN, DataType::Float32, true),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(row_ids),
+                Arc::new(codes),
+                Arc::new(add_factors),
+                Arc::new(scale_factors),
+            ],
+        )
+        .unwrap();
+
+        let storage =
+            RabitQuantizationStorage::try_from_batch(batch, &metadata, DistanceType::L2, None)
+                .unwrap();
+
+        let centroid = Float32Array::from_iter_values((0..DIM).map(|v| v as f32 * 0.25));
+        let query = Float32Array::from_iter_values((0..DIM).map(|v| v as f32 * 0.75));
+        let qr = Float32Array::from(
+            query
+                .values()
+                .iter()
+                .zip(centroid.values().iter())
+                .map(|(q, c)| q - c)
+                .collect::<Vec<_>>(),
+        );
+
+        let dist_q_c = 0.123_f32;
+
+        let slow = storage
+            .dist_calculator(Arc::new(qr), dist_q_c)
+            .distance_all(0);
+
+        let q_r = rq.rotate_vector(&query).unwrap();
+        let c_r = rq.rotate_vector(&centroid).unwrap();
+
+        let mut storage_fast = storage.clone();
+        storage_fast
+            .set_ivf_centroid(Arc::new(centroid) as ArrayRef, Some(c_r as ArrayRef))
+            .unwrap();
+        let fast = storage_fast
+            .dist_calculator(q_r as ArrayRef, dist_q_c)
+            .distance_all(0);
+
+        assert_eq!(slow.len(), fast.len());
+        for (a, b) in slow.into_iter().zip(fast.into_iter()) {
+            assert!((a - b).abs() <= 1e-4, "distance mismatch: {} vs {}", a, b);
         }
     }
 }

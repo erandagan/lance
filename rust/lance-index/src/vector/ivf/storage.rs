@@ -31,6 +31,11 @@ pub struct IvfModel {
     /// It is a 2-D `(num_partitions * dimension)` of vector array.
     pub centroids: Option<FixedSizeListArray>,
 
+    /// Precomputed rotated centroids for Rabit quantization (IVF_RQ).
+    ///
+    /// It is a 2-D `(num_partitions * code_dim)` array where each row is `centroid * R`.
+    pub rotated_centroids: Option<FixedSizeListArray>,
+
     /// Offset of each partition in the file.
     pub offsets: Vec<usize>,
 
@@ -47,6 +52,11 @@ impl DeepSizeOf for IvfModel {
             .as_ref()
             .map(|centroids| centroids.get_array_memory_size())
             .unwrap_or_default()
+            + self
+                .rotated_centroids
+                .as_ref()
+                .map(|centroids| centroids.get_array_memory_size())
+                .unwrap_or_default()
             + self.lengths.deep_size_of_children(context)
             + self.offsets.deep_size_of_children(context)
     }
@@ -56,6 +66,7 @@ impl IvfModel {
     pub fn empty() -> Self {
         Self {
             centroids: None,
+            rotated_centroids: None,
             offsets: vec![],
             lengths: vec![],
             loss: None,
@@ -65,6 +76,7 @@ impl IvfModel {
     pub fn new(centroids: FixedSizeListArray, loss: Option<f64>) -> Self {
         Self {
             centroids: Some(centroids),
+            rotated_centroids: None,
             offsets: vec![],
             lengths: vec![],
             loss,
@@ -73,6 +85,10 @@ impl IvfModel {
 
     pub fn centroid(&self, partition: usize) -> Option<ArrayRef> {
         self.centroids.as_ref().map(|c| c.value(partition))
+    }
+
+    pub fn rotated_centroid(&self, partition: usize) -> Option<ArrayRef> {
+        self.rotated_centroids.as_ref().map(|c| c.value(partition))
     }
 
     /// Ivf model dimension.
@@ -190,6 +206,11 @@ impl TryFrom<&IvfModel> for PbIvf {
             offsets: ivf.offsets.iter().map(|x| *x as u64).collect(),
             centroids_tensor: ivf.centroids.as_ref().map(|c| c.try_into()).transpose()?,
             loss: ivf.loss,
+            rotated_centroids_tensor: ivf
+                .rotated_centroids
+                .as_ref()
+                .map(|c| c.try_into())
+                .transpose()?,
         })
     }
 }
@@ -217,6 +238,11 @@ impl TryFrom<PbIvf> for IvfModel {
             // which does not have centroids.
             None
         };
+        let rotated_centroids = proto
+            .rotated_centroids_tensor
+            .as_ref()
+            .map(FixedSizeListArray::try_from)
+            .transpose()?;
         // We are not using offsets from the protobuf, which was the file offset in the
         // v1 index format. It will be deprecated soon.
         //
@@ -236,6 +262,7 @@ impl TryFrom<PbIvf> for IvfModel {
         assert_eq!(offsets.len(), proto.lengths.len());
         Ok(Self {
             centroids,
+            rotated_centroids,
             offsets,
             lengths: proto.lengths,
             loss: proto.loss,
@@ -325,6 +352,7 @@ mod tests {
             offsets: vec![0, 2],
             centroids_tensor: None,
             loss: None,
+            rotated_centroids_tensor: None,
         };
 
         let ivf = IvfModel::try_from(pb_ivf).unwrap();
