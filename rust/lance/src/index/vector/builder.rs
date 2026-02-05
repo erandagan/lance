@@ -428,26 +428,13 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     "IVF build params not set",
                     location!(),
                 ))?;
-                let value_type = infer_vector_element_type(
-                    &dataset
-                        .schema()
-                        .field(&self.column)
-                        .ok_or_else(|| {
-                            Error::invalid_input(
-                                format!("vector column {} does not exist", self.column),
-                                location!(),
-                            )
-                        })?
-                        .data_type(),
-                )?;
-                let rotation_matrix = self.ensure_pq_rotation_matrix(dim, &value_type)?;
                 super::build_ivf_model(
                     &dataset,
                     &self.column,
                     dim,
                     self.distance_type,
                     &ivf_params,
-                    rotation_matrix.as_ref(),
+                    None,
                 )
                 .await
             }
@@ -494,16 +481,8 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
         // we filtered out nulls when sampling, but we still need to filter out NaNs and INFs here
         let training_data = arrow::compute::filter(&training_data, &is_finite(&training_data))?;
         let training_data = training_data.as_fixed_size_list();
-        let training_data = if let Some(rotation_mat) = self.ensure_pq_rotation_matrix(
-            training_data.value_length() as usize,
-            &training_data.value_type(),
-        )? {
-            rotate_fsl(training_data, &rotation_mat)?
-        } else {
-            training_data.clone()
-        };
-
-        let training_data = match (self.ivf.as_ref(), Q::use_residual(self.distance_type)) {
+        let use_residual = Q::use_residual(self.distance_type);
+        let training_data = match (self.ivf.as_ref(), use_residual) {
             (Some(ivf), true) => {
                 let ivf_transformer = lance_index::vector::ivf::new_ivf_transformer(
                     ivf.centroids.clone().unwrap(),
@@ -514,6 +493,14 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> IvfIndexBuilder<S, Q> 
                     .in_scope(|| ivf_transformer.compute_residual(&training_data))?
             }
             _ => training_data.clone(),
+        };
+        let training_data = if let Some(rotation_mat) = self.ensure_pq_rotation_matrix(
+            training_data.value_length() as usize,
+            &training_data.value_type(),
+        )? {
+            rotate_fsl(&training_data, &rotation_mat)?
+        } else {
+            training_data.clone()
         };
 
         info!("Start to train quantizer");

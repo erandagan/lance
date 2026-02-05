@@ -335,7 +335,6 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
     #[instrument(level = "debug", skip(self))]
     pub fn preprocess_query(&self, partition_id: usize, query: &Query) -> Result<Query> {
         let mut part_query = query.clone();
-        part_query.key = self.rotate_query_key_if_needed(&query.key)?;
 
         if Q::use_residual(self.distance_type) {
             let partition_centroids =
@@ -347,10 +346,9 @@ impl<S: IvfSubIndex + 'static, Q: Quantization> IVFIndex<S, Q> {
                     })?;
             let residual_key = sub(&part_query.key, &partition_centroids)?;
             part_query.key = residual_key;
-            Ok(part_query)
-        } else {
-            Ok(part_query)
         }
+        part_query.key = self.rotate_query_key_if_needed(&part_query.key)?;
+        Ok(part_query)
     }
 }
 
@@ -482,8 +480,7 @@ impl<S: IvfSubIndex + 'static, Q: Quantization + 'static> VectorIndex for IVFInd
         };
 
         let max_nprobes = query.maximum_nprobes.unwrap_or(self.ivf.num_partitions());
-        let key = self.rotate_query_key_if_needed(&query.key)?;
-        self.ivf.find_partitions(key.as_ref(), max_nprobes, dt)
+        self.ivf.find_partitions(query.key.as_ref(), max_nprobes, dt)
     }
 
     fn total_partitions(&self) -> usize {

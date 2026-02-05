@@ -205,17 +205,6 @@ impl IvfTransformer {
         };
         transforms.push(Arc::new(KeepFiniteVectors::new(vector_column)));
 
-        if let Some(seed) = pq.rotation_seed {
-            let rotate_mat = pq.rotation_matrix.clone().unwrap_or_else(|| {
-                random_rotation_matrix(pq.dimension as i32, &pq.codebook.value_type(), seed)
-                    .expect("failed to build random rotation matrix for IVF_PQ")
-            });
-            transforms.push(Arc::new(RandomRotationTransformer::new(
-                vector_column,
-                rotate_mat,
-            )));
-        }
-
         let partition_transform = Arc::new(PartitionTransformer::new(
             centroids.clone(),
             distance_type,
@@ -230,11 +219,24 @@ impl IvfTransformer {
             )));
         }
 
-        if ProductQuantizer::use_residual(distance_type) {
+        let use_residual = ProductQuantizer::use_residual(distance_type);
+        if use_residual {
             transforms.push(Arc::new(ResidualTransform::new(
                 centroids.clone(),
                 PART_ID_COLUMN,
                 vector_column,
+            )));
+        }
+
+        if let Some(seed) = pq.rotation_seed {
+            let rotate_mat = pq.rotation_matrix.clone().unwrap_or_else(|| {
+                random_rotation_matrix(pq.dimension as i32, &pq.codebook.value_type(), seed)
+                    .expect("failed to build random rotation matrix for IVF_PQ")
+            });
+            // Rotate the PQ input only. For residual PQ, rotate the residual vectors.
+            transforms.push(Arc::new(RandomRotationTransformer::new(
+                vector_column,
+                rotate_mat,
             )));
         }
         transforms.push(Arc::new(PQTransformer::new(
@@ -373,5 +375,72 @@ impl Transformer for IvfTransformer {
             batch = transform.transform(&batch)?;
         }
         Ok(batch)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::UInt8Type;
+    use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+    use lance_arrow::FixedSizeListArrayExt;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_ivf_pq_rotation_applies_to_residual() -> Result<()> {
+        let centroids = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![1.0, 0.0]),
+            2,
+        )?;
+
+        let mut codebook_values = vec![1000.0f32; 256 * 2];
+        codebook_values[0] = 3.0;
+        codebook_values[1] = 1.0;
+        codebook_values[2] = 2.0;
+        codebook_values[3] = 2.0;
+        let codebook = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(codebook_values),
+            2,
+        )?;
+
+        let rotation = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![0.0, 1.0, 1.0, 0.0]),
+            2,
+        )?;
+
+        let pq = ProductQuantizer::new(1, 8, 2, codebook, DistanceType::L2)
+            .with_rotation(Some(0), Some(rotation));
+        let transformer = IvfTransformer::with_pq(
+            centroids,
+            DistanceType::L2,
+            "vector",
+            pq,
+            None,
+        );
+
+        let vectors = FixedSizeListArray::try_new_from_values(
+            Float32Array::from(vec![2.0, 3.0]),
+            2,
+        )?;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2),
+            false,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(vectors)])?;
+
+        let transformed = transformer.transform(&batch)?;
+        let pq_codes = transformed
+            .column_by_name(PQ_CODE_COLUMN)
+            .unwrap()
+            .as_fixed_size_list();
+        let code = pq_codes
+            .values()
+            .as_primitive::<UInt8Type>()
+            .value(0);
+        assert_eq!(code, 0);
+        Ok(())
     }
 }
