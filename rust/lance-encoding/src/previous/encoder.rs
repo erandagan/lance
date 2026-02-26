@@ -512,10 +512,15 @@ fn get_dict_encoding_threshold() -> u64 {
         .unwrap_or(100)
 }
 
-// check whether we want to use dictionary encoding or not
-// by applying a threshold on cardinality
-// returns true if cardinality < threshold but false if the total number of rows is less than the threshold
-// The choice to use 100 is just a heuristic for now
+// Check whether dictionary encoding is worthwhile for legacy UTF8 pages.
+//
+// We track exact unique values until `threshold` and bail out early once we hit
+// the limit. This avoids building a full set for high-cardinality inputs while
+// keeping the decision deterministic.
+//
+// Returns true only when:
+// 1. total row count is at least `threshold`, and
+// 2. exact distinct count is strictly less than `threshold`.
 fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     let num_total_rows = arrays.iter().map(|arr| arr.len()).sum::<usize>();
     if num_total_rows < threshold as usize {
