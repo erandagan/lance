@@ -61,8 +61,8 @@ impl AllNullDataBlock {
 
 use std::collections::HashMap;
 
-// `BlockInfo` stores the statistics of this `DataBlock`, such as `NullCount` for `NullableDataBlock`,
-// `BitWidth` for `FixedWidthDataBlock`, `Cardinality` for all `DataBlock`
+// `BlockInfo` stores the statistics of this `DataBlock`, such as `NullCount` for `NullableDataBlock`
+// and `BitWidth` for `FixedWidthDataBlock`.
 #[derive(Debug, Clone)]
 pub struct BlockInfo(pub Arc<RwLock<HashMap<Stat, Arc<dyn Array>>>>);
 

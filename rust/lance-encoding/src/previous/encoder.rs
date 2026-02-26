@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, env, hash::RandomState, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    sync::Arc,
+};
 
 use arrow_array::{cast::AsArray, ArrayRef, UInt8Array};
 use arrow_schema::DataType;
-use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use snafu::location;
 
 use crate::{
@@ -513,25 +516,21 @@ fn get_dict_encoding_threshold() -> u64 {
 // by applying a threshold on cardinality
 // returns true if cardinality < threshold but false if the total number of rows is less than the threshold
 // The choice to use 100 is just a heuristic for now
-// hyperloglog is used for cardinality estimation
-// error rate = 1.04 / sqrt(2^p), where p is the precision
-// and error rate is 1.04 / sqrt(2^12) = 1.56%
 fn check_dict_encoding(arrays: &[ArrayRef], threshold: u64) -> bool {
     let num_total_rows = arrays.iter().map(|arr| arr.len()).sum::<usize>();
     if num_total_rows < threshold as usize {
         return false;
     }
-    const PRECISION: u8 = 12;
-
-    let mut hll: HyperLogLogPlus<String, RandomState> =
-        HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
+    let threshold = usize::try_from(threshold).unwrap_or(usize::MAX);
+    let mut unique_values = HashSet::with_capacity(threshold.min(1024));
 
     for arr in arrays {
         let string_array = arrow_array::cast::as_string_array(arr);
         for value in string_array.iter().flatten() {
-            hll.insert(value);
-            let estimated_cardinality = hll.count() as u64;
-            if estimated_cardinality >= threshold {
+            if !unique_values.contains(value) {
+                unique_values.insert(value.to_string());
+            }
+            if unique_values.len() >= threshold {
                 return false;
             }
         }

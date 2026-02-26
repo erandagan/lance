@@ -4969,7 +4969,6 @@ dependencies = [
  "fsst",
  "futures",
  "hex",
- "hyperloglogplus",
  "itertools 0.13.0",
  "lance-arrow",
  "lance-bitpacking",

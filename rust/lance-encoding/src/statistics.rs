@@ -3,12 +3,10 @@
 
 use std::{
     fmt::{self},
-    hash::{Hash, RandomState},
     sync::Arc,
 };
 
 use arrow_array::{cast::AsArray, types::UInt64Type, Array, ArrowPrimitiveType, UInt64Array};
-use hyperloglogplus::{HyperLogLog, HyperLogLogPlus};
 use num_traits::PrimInt;
 
 use crate::data::{
@@ -20,7 +18,6 @@ use crate::data::{
 pub enum Stat {
     BitWidth,
     DataSize,
-    Cardinality,
     FixedSize,
     NullCount,
     MaxLength,
@@ -33,7 +30,6 @@ impl fmt::Debug for Stat {
         match self {
             Self::BitWidth => write!(f, "BitWidth"),
             Self::DataSize => write!(f, "DataSize"),
-            Self::Cardinality => write!(f, "Cardinality"),
             Self::FixedSize => write!(f, "FixedSize"),
             Self::NullCount => write!(f, "NullCount"),
             Self::MaxLength => write!(f, "MaxLength"),
@@ -186,31 +182,12 @@ impl GetStat for NullableDataBlock {
 
 impl GetStat for VariableWidthBlock {
     fn get_stat(&self, stat: Stat) -> Option<Arc<dyn Array>> {
-        {
-            let block_info = self.block_info.0.read().unwrap();
-            if block_info.is_empty() {
-                panic!("get_stat should be called after statistics are computed.");
-            }
-            if let Some(stat_value) = block_info.get(&stat) {
-                return Some(stat_value.clone());
-            }
-        }
+        let block_info = self.block_info.0.read().unwrap();
 
-        if stat != Stat::Cardinality {
-            return None;
-        }
-
-        let computed = self.compute_cardinality();
-        let mut block_info = self.block_info.0.write().unwrap();
         if block_info.is_empty() {
             panic!("get_stat should be called after statistics are computed.");
         }
-        Some(
-            block_info
-                .entry(stat)
-                .or_insert_with(|| computed.clone())
-                .clone(),
-        )
+        block_info.get(&stat).cloned()
     }
 }
 
@@ -230,55 +207,6 @@ impl GetStat for FixedSizeListBlock {
 }
 
 impl VariableWidthBlock {
-    // Caveat: the computation here assumes VariableWidthBlock.offsets maps directly to VariableWidthBlock.data
-    // without any adjustment(for example, no null_adjustment for offsets)
-    fn compute_cardinality(&self) -> Arc<dyn Array> {
-        const PRECISION: u8 = 4;
-        // The default hasher (currently sip hash 1-3) does not seem to give good results
-        // with HLL.
-        //
-        // In particular, when using randomly generated 12-byte strings, the HLL count was
-        // suggested a cardinality of 500 (out of 1000 unique items and hashes) at least 10%
-        // of the time.
-        //
-        // Using xxhash3 consistently gives better results.
-        let mut hll: HyperLogLogPlus<&[u8], xxhash_rust::xxh3::Xxh3Builder> =
-            HyperLogLogPlus::new(PRECISION, xxhash_rust::xxh3::Xxh3Builder::default()).unwrap();
-
-        match self.bits_per_offset {
-            32 => {
-                let offsets_ref = self.offsets.borrow_to_typed_slice::<u32>();
-                let offsets: &[u32] = offsets_ref.as_ref();
-
-                offsets
-                    .iter()
-                    .zip(offsets.iter().skip(1))
-                    .for_each(|(&start, &end)| {
-                        hll.insert(&self.data[start as usize..end as usize]);
-                    });
-                let cardinality = hll.count() as u64;
-                Arc::new(UInt64Array::from(vec![cardinality]))
-            }
-            64 => {
-                let offsets_ref = self.offsets.borrow_to_typed_slice::<u64>();
-                let offsets: &[u64] = offsets_ref.as_ref();
-
-                offsets
-                    .iter()
-                    .zip(offsets.iter().skip(1))
-                    .for_each(|(&start, &end)| {
-                        hll.insert(&self.data[start as usize..end as usize]);
-                    });
-
-                let cardinality = hll.count() as u64;
-                Arc::new(UInt64Array::from(vec![cardinality]))
-            }
-            _ => {
-                unreachable!("the bits_per_offset of VariableWidthBlock can only be 32 or 64")
-            }
-        }
-    }
-
     fn max_length(&mut self) -> Arc<dyn Array> {
         match self.bits_per_offset {
             32 => {
@@ -323,30 +251,13 @@ impl GetStat for AllNullDataBlock {
 
 impl GetStat for FixedWidthDataBlock {
     fn get_stat(&self, stat: Stat) -> Option<Arc<dyn Array>> {
-        {
-            let block_info = self.block_info.0.read().unwrap();
+        let block_info = self.block_info.0.read().unwrap();
 
-            if block_info.is_empty() {
-                panic!("get_stat should be called after statistics are computed.");
-            }
-
-            if let Some(stat_value) = block_info.get(&stat) {
-                return Some(stat_value.clone());
-            }
+        if block_info.is_empty() {
+            panic!("get_stat should be called after statistics are computed.");
         }
 
-        if stat == Stat::Cardinality && (self.bits_per_value == 64 || self.bits_per_value == 128) {
-            let computed = self.cardinality();
-            let mut block_info = self.block_info.0.write().unwrap();
-            Some(
-                block_info
-                    .entry(stat)
-                    .or_insert_with(|| computed.clone())
-                    .clone(),
-            )
-        } else {
-            None
-        }
+        block_info.get(&stat).cloned()
     }
 }
 
@@ -402,39 +313,6 @@ impl FixedWidthDataBlock {
                 )))
             }
             _ => Arc::new(UInt64Array::from(vec![self.bits_per_value])),
-        }
-    }
-
-    fn cardinality(&self) -> Arc<dyn Array> {
-        match self.bits_per_value {
-            64 => {
-                let u64_slice_ref = self.data.borrow_to_typed_slice::<u64>();
-                let u64_slice = u64_slice_ref.as_ref();
-
-                const PRECISION: u8 = 4;
-                let mut hll: HyperLogLogPlus<u64, xxhash_rust::xxh3::Xxh3Builder> =
-                    HyperLogLogPlus::new(PRECISION, xxhash_rust::xxh3::Xxh3Builder::default())
-                        .unwrap();
-                for val in u64_slice {
-                    hll.insert(val);
-                }
-                let cardinality = hll.count() as u64;
-                Arc::new(UInt64Array::from(vec![cardinality]))
-            }
-            128 => {
-                let u128_slice_ref = self.data.borrow_to_typed_slice::<u128>();
-                let u128_slice = u128_slice_ref.as_ref();
-
-                const PRECISION: u8 = 4;
-                let mut hll: HyperLogLogPlus<u128, RandomState> =
-                    HyperLogLogPlus::new(PRECISION, RandomState::new()).unwrap();
-                for val in u128_slice {
-                    hll.insert(val);
-                }
-                let cardinality = hll.count() as u64;
-                Arc::new(UInt64Array::from(vec![cardinality]))
-            }
-            _ => unreachable!(),
         }
     }
 
@@ -1068,62 +946,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cardinality_variable_width_datablock() {
-        let string_array = StringArray::from(vec![Some("hello"), Some("world")]);
-        let block = DataBlock::from_array(string_array);
-        let expected_cardinality = 2;
-        let actual_cardinality = block.expect_single_stat::<UInt64Type>(Stat::Cardinality);
-        assert_eq!(actual_cardinality, expected_cardinality,);
-
-        let string_array = StringArray::from(vec![
-            Some("to be named by variables"),
-            Some("to be passed as arguments to procedures"),
-            Some("to be returned as values of procedures"),
-        ]);
-        let block = DataBlock::from_array(string_array);
-        let expected_cardinality = 3;
-        let actual_cardinality = block.expect_single_stat::<UInt64Type>(Stat::Cardinality);
-
-        assert_eq!(actual_cardinality, expected_cardinality,);
-
-        let string_array = StringArray::from(vec![
-            Some("Samuel Eilenberg"),
-            Some("Saunders Mac Lane"),
-            Some("Samuel Eilenberg"),
-        ]);
-        let block = DataBlock::from_array(string_array);
-        let expected_cardinality = 2;
-        let actual_cardinality = block.expect_single_stat::<UInt64Type>(Stat::Cardinality);
-        assert_eq!(actual_cardinality, expected_cardinality,);
-
-        let string_array = LargeStringArray::from(vec![Some("hello"), Some("world")]);
-        let block = DataBlock::from_array(string_array);
-        let expected_cardinality = 2;
-        let actual_cardinality = block.expect_single_stat::<UInt64Type>(Stat::Cardinality);
-        assert_eq!(actual_cardinality, expected_cardinality,);
-
-        let string_array = LargeStringArray::from(vec![
-            Some("to be named by variables"),
-            Some("to be passed as arguments to procedures"),
-            Some("to be returned as values of procedures"),
-        ]);
-        let block = DataBlock::from_array(string_array);
-        let expected_cardinality = 3;
-        let actual_cardinality = block.expect_single_stat::<UInt64Type>(Stat::Cardinality);
-        assert_eq!(actual_cardinality, expected_cardinality,);
-
-        let string_array = LargeStringArray::from(vec![
-            Some("Samuel Eilenberg"),
-            Some("Saunders Mac Lane"),
-            Some("Samuel Eilenberg"),
-        ]);
-        let block = DataBlock::from_array(string_array);
-        let expected_cardinality = 2;
-        let actual_cardinality = block.expect_single_stat::<UInt64Type>(Stat::Cardinality);
-        assert_eq!(actual_cardinality, expected_cardinality,);
-    }
-
-    #[test]
     fn test_max_length_variable_width_datablock() {
         let string_array = StringArray::from(vec![Some("hello"), Some("world")]);
         let block = DataBlock::from_array(string_array.clone());
@@ -1211,59 +1033,5 @@ mod tests {
         let expected_run_count = 3;
         let actual_run_count = block.expect_single_stat::<UInt64Type>(Stat::RunCount);
         assert_eq!(actual_run_count, expected_run_count);
-    }
-
-    #[test]
-    fn test_fixed_width_cardinality_is_lazy() {
-        let int64_array = Int64Array::from(vec![1, 2, 3, 1, 2, 3, 1]);
-        let block = DataBlock::from_array(int64_array);
-
-        let DataBlock::FixedWidth(fixed) = &block else {
-            panic!("Expected FixedWidth datablock");
-        };
-
-        let info = fixed.block_info.0.read().unwrap();
-        assert!(info.contains_key(&Stat::DataSize));
-        assert!(info.contains_key(&Stat::BitWidth));
-        assert!(!info.contains_key(&Stat::Cardinality));
-    }
-
-    #[test]
-    fn test_fixed_width_cardinality_computed_on_demand() {
-        let int64_array = Int64Array::from(vec![1, 2, 3, 1, 2, 3, 1]);
-        let block = DataBlock::from_array(int64_array);
-
-        let cardinality = block.expect_single_stat::<UInt64Type>(Stat::Cardinality);
-        assert_eq!(cardinality, 3);
-
-        let DataBlock::FixedWidth(fixed) = &block else {
-            panic!("Expected FixedWidth datablock");
-        };
-
-        let info = fixed.block_info.0.read().unwrap();
-        assert!(info.contains_key(&Stat::Cardinality));
-    }
-
-    #[test]
-    fn test_variable_width_cardinality_is_lazy() {
-        let string_array = StringArray::from(vec!["a", "b", "a"]);
-        let block = DataBlock::from_array(string_array);
-
-        let DataBlock::VariableWidth(var) = &block else {
-            panic!("Expected VariableWidth datablock");
-        };
-
-        {
-            let info = var.block_info.0.read().unwrap();
-            assert!(info.contains_key(&Stat::DataSize));
-            assert!(info.contains_key(&Stat::MaxLength));
-            assert!(!info.contains_key(&Stat::Cardinality));
-        }
-
-        let cardinality = block.expect_single_stat::<UInt64Type>(Stat::Cardinality);
-        assert_eq!(cardinality, 2);
-
-        let info = var.block_info.0.read().unwrap();
-        assert!(info.contains_key(&Stat::Cardinality));
     }
 }
