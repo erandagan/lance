@@ -8,7 +8,7 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 
 ## Schema Design
 
-- Annotate fields with `optional` only when truly optional; omit it for required fields — `optional` maps to nullable types (e.g., `Option<T>` in Rust), bare fields map to non-nullable `T`.
+- Use `optional` when you need to distinguish "not set" from "zero value" — `optional` enables presence tracking (`has_*` methods) and maps to `Option<T>` in Rust. Bare proto3 fields have no presence semantics: they always hold a value (defaulting to zero), so you cannot tell if the sender explicitly set them.
 - Use structured message types (e.g., `BasePath`) instead of plain scalars, and scope fields to operation-specific messages (e.g., `InsertTransaction`) rather than generic top-level ones.
 - Don't duplicate data across messages — store each fact once and derive relationships. Prefer parallel sequences over maps when keys already exist in another field.
 

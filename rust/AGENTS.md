@@ -14,7 +14,7 @@ Also see [root AGENTS.md](../AGENTS.md) for cross-language standards.
 - Place `#[cfg(test)] mod tests` as a single block at the bottom of each file — no production code after it.
 - Place `use` imports at the top of the file, not inline within function bodies.
 - Extract substantial new logic (bin packing, scheduling) into dedicated submodules instead of inlining into large files.
-- Delete obsolete methods in the same PR that introduces their replacements.
+- Delete obsolete internal (`pub(crate)` / private) methods in the same PR that introduces their replacements. For public API methods, follow the deprecation path in root AGENTS.md instead.
 - Choose log levels by audience: `debug!` for routine/high-frequency ops, `info!` for infrequent operator-visible state changes, `warn!` for unexpected conditions.
 
 ## API Design
