@@ -78,6 +78,8 @@ pub mod refs;
 pub(crate) mod rowids;
 pub mod scanner;
 mod schema_evolution;
+#[cfg(feature = "substrait")]
+mod substrait_compat;
 pub mod sql;
 pub mod statistics;
 mod take;

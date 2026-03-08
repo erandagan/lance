@@ -4707,16 +4707,18 @@ def _needs_substrait_placeholder(t: pa.DataType) -> bool:
     """Return True if *t* contains a type that PyArrow's substrait serializer
     cannot handle at any nesting depth.
 
-    Three cases require a placeholder:
+    Four cases require a placeholder:
 
-    * ``fixed_size_list`` — substrait has no equivalent type.
-    * Arrow extension types (e.g. ``fixed_shape_tensor``) — substrait cannot
+    * ``fixed_size_list``, ``large_list`` - substrait has no equivalent type.
+    * Arrow extension types (e.g. ``fixed_shape_tensor``) - substrait cannot
       represent them.
-    * A struct whose fields carry non-``None`` metadata — substrait rejects
+    * A struct whose fields carry non-``None`` metadata - substrait rejects
       such structs.  Extension types leave ``metadata={}`` on struct fields
       after a lance round-trip; ``{}`` is non-``None``.
     """
     if pa.types.is_fixed_size_list(t):
+        return True
+    if pa.types.is_large_list(t):
         return True
     if isinstance(t, pa.lib.BaseExtensionType):
         return True
@@ -4727,7 +4729,7 @@ def _needs_substrait_placeholder(t: pa.DataType) -> bool:
                 return True
             if _needs_substrait_placeholder(f.type):
                 return True
-    if pa.types.is_list(t) or pa.types.is_large_list(t):
+    if pa.types.is_list(t):
         return _needs_substrait_placeholder(t.value_type)
     return False
 

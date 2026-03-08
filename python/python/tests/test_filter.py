@@ -370,6 +370,59 @@ def test_filter_on_column_beside_root_extension_type(tmp_path):
     assert result["id"].to_pylist() == [1]
 
 
+def test_filter_on_column_beside_list_struct(tmp_path):
+    """Filtering on a sibling column when the schema contains list<struct>.
+
+    list<struct> columns are passed through to the Rust substrait parser,
+    which normalizes PyArrow's shallow naming convention to DataFusion's
+    deep convention. The list<struct> column must precede the filtered column
+    to exercise this normalization.
+    """
+    list_struct_type = pa.list_(
+        pa.struct([pa.field("value", pa.float32()), pa.field("label", pa.utf8())])
+    )
+    arrow_table = pa.table(
+        {
+            "id": pa.array([1, 2, 3], pa.int64()),
+            "items": pa.array(
+                [[{"value": 1.0, "label": "a"}], [{"value": 2.0, "label": "b"}], []],
+                type=list_struct_type,
+            ),
+            "checkpoint": pa.array([None, 5, None], pa.int64()),
+        }
+    )
+    ds = lance.write_dataset(arrow_table, tmp_path)
+
+    expr = pc.field("checkpoint").is_null() | (pc.field("checkpoint") == 0)
+    result = ds.to_table(filter=expr)
+    assert result["id"].to_pylist() == [1, 3]
+
+
+def test_filter_on_column_beside_large_list_struct(tmp_path):
+    """Filtering on a sibling column when the schema contains large_list<struct>.
+
+    PyArrow cannot serialize large_list to substrait, so it is replaced
+    with a placeholder on the Python side.
+    """
+    large_list_struct_type = pa.large_list(
+        pa.struct([pa.field("x", pa.int32()), pa.field("y", pa.int32())])
+    )
+    arrow_table = pa.table(
+        {
+            "id": pa.array([10, 20], pa.int64()),
+            "data": pa.array(
+                [[{"x": 1, "y": 2}], [{"x": 3, "y": 4}]],
+                type=large_list_struct_type,
+            ),
+        }
+    )
+    ds = lance.write_dataset(arrow_table, tmp_path)
+
+    expr = pc.field("id") > 15
+    result = ds.to_table(filter=expr)
+    assert result["id"].to_pylist() == [20]
+
+
 @pytest.mark.skip(
     reason="enable this in recurring test https://github.com/lance-format/lance/pull/4190"
     " as it requires release mode"

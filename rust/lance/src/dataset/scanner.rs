@@ -439,7 +439,11 @@ impl ExprFilter {
                 let ctx = get_session_context(&LanceExecutionOptions::default());
                 let state = ctx.state();
                 let schema = Arc::new(ArrowSchema::from(dataset_schema));
-                let expr = parse_substrait(expr, schema.clone(), &ctx.state())
+                // PyArrow's substrait uses a shallow naming convention for
+                // list element fields.  Normalize to the deep convention
+                // that DataFusion expects before parsing.
+                let expr = super::substrait_compat::normalize_for_datafusion(expr, &schema)?;
+                let expr = parse_substrait(&expr, schema.clone(), &ctx.state())
                     .now_or_never()
                     .expect("could not parse the Substrait filter in a synchronous fashion")?;
                 let planner = Planner::new(schema);

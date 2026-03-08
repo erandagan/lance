@@ -67,6 +67,7 @@ datafusion-functions.workspace = true
 datafusion-physical-expr.workspace = true
 datafusion-physical-plan.workspace = true
 datafusion-expr.workspace = true
+datafusion-substrait = { workspace = true, optional = true }
 either.workspace = true
 lapack = { version = "0.19.0", optional = true }
 snafu = { workspace = true }
@@ -125,7 +126,7 @@ fp16kernels = ["lance-linalg/fp16kernels"]
 cli = ["dep:clap", "lzma-sys/static"]
 dynamodb = ["lance-table/dynamodb", "dep:aws-sdk-dynamodb"]
 dynamodb_tests = ["dynamodb"]
-substrait = ["lance-datafusion/substrait"]
+substrait = ["lance-datafusion/substrait", "dep:datafusion-substrait"]
 protoc = [
     "lance-encoding/protoc",
     "lance-file/protoc",
