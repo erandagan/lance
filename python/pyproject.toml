@@ -1,5 +1,5 @@
 [project]
-name = "pylance"
+name = "pylance-botika"
 dynamic = ["version"]
 dependencies = ["pyarrow>=14", "numpy>=1.22", "lance-namespace>=0.5.2"]
 description = "python wrapper for Lance columnar format"

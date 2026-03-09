@@ -1,0 +1,28 @@
+name: Build & Release Wheel
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+jobs:
+  build-wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Linux x86_64 wheel
+        uses: ./.github/workflows/build_linux_wheel
+        with:
+          python-minor-version: "9"
+          args: "--release --strip"
+
+      - name: Create GitHub Release & upload wheel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ inputs.tag }}" \
+            --title "${{ inputs.tag }}" \
+            --notes "pylance-botika wheel (temporary fork with list<struct> substrait fix)" \
+            python/target/wheels/pylance_botika-*.whl
