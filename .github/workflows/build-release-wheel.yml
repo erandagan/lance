@@ -7,22 +7,48 @@ on:
         required: true
 
 jobs:
-  build-wheel:
+  build-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - name: Build Linux x86_64 wheel
         uses: ./.github/workflows/build_linux_wheel
         with:
           python-minor-version: "9"
           args: "--release --strip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux
+          path: python/target/wheels/pylance_botika-*.whl
 
-      - name: Create GitHub Release & upload wheel
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build macOS ARM wheel
+        uses: ./.github/workflows/build_mac_wheel
+        with:
+          python-minor-version: "9"
+          args: "--release --strip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-macos
+          path: python/target/wheels/pylance_botika-*.whl
+
+  release:
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: wheels
+          merge-multiple: true
+      - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${{ inputs.tag }}" \
+            --repo "${{ github.repository }}" \
             --title "${{ inputs.tag }}" \
             --notes "pylance-botika wheel (temporary fork with list<struct> substrait fix)" \
-            python/target/wheels/pylance_botika-*.whl
+            wheels/*.whl
