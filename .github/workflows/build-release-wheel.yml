@@ -19,7 +19,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-linux
-          path: python/target/wheels/pylance_botika-*.whl
+          path: python/target/wheels/pylance-*.whl
 
   build-macos:
     runs-on: macos-latest
@@ -33,7 +33,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-macos
-          path: python/target/wheels/pylance_botika-*.whl
+          path: python/target/wheels/pylance-*.whl
 
   release:
     needs: [build-linux, build-macos]
