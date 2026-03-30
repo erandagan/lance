@@ -50,5 +50,5 @@ jobs:
           gh release create "${{ inputs.tag }}" \
             --repo "${{ github.repository }}" \
             --title "${{ inputs.tag }}" \
-            --notes "pylance-botika wheel (temporary fork with list<struct> substrait fix)" \
+            --notes "pylance-botika wheel" \
             wheels/*.whl
