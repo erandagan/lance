@@ -10,7 +10,7 @@ use super::{CommitBuilder, WriteParams, write_fragments_internal};
 use crate::dataset::rowids::get_row_id_index;
 use crate::dataset::transaction::UpdateMode::RewriteRows;
 use crate::dataset::transaction::{Operation, Transaction};
-use crate::dataset::utils::make_rowid_capture_stream;
+use crate::dataset::utils::{SchemaAdapter, make_rowid_capture_stream};
 use crate::{Dataset, io::exec::Planner};
 use crate::{Error, Result};
 use arrow_array::RecordBatch;
@@ -266,6 +266,12 @@ impl UpdateJob {
         // fragments and then set the row id segments in the new fragments.
         let (stream, row_id_rx) =
             make_rowid_capture_stream(stream, self.dataset.manifest.uses_stable_row_ids())?;
+
+        // The scan may decode lance.json (LargeBinary) back to arrow.json (Utf8).
+        // Convert arrow.json columns back to lance.json so the schema matches
+        // the dataset's physical schema.
+        let adapter = SchemaAdapter::new(stream.schema());
+        let stream = adapter.to_physical_stream(stream);
 
         let schema = stream.schema();
 
@@ -1344,5 +1350,92 @@ mod tests {
                 fragment_id
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_update_with_json_column() {
+        use lance_arrow::json::json_field;
+
+        // Create a dataset with a JSON column
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            json_field("metadata", true),
+        ]));
+
+        let json_array =
+            lance_arrow::json::JsonArray::try_from_iter(vec![
+                Some(r#"{"key": "val1"}"#),
+                Some(r#"{"key": "val2"}"#),
+                Some(r#"{"key": "val3"}"#),
+            ])
+            .unwrap();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..3)),
+                Arc::new(StringArray::from_iter_values(["a", "b", "c"])),
+                Arc::new(json_array.into_inner()),
+            ],
+        )
+        .unwrap();
+
+        let test_dir = TempStrDir::default();
+        let test_uri = &test_dir;
+
+        let write_params = WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_0),
+            ..Default::default()
+        };
+
+        let batches = RecordBatchIterator::new([Ok(batch)], schema.clone());
+        let ds = Dataset::write(batches, test_uri, Some(write_params))
+            .await
+            .unwrap();
+
+        // Update an unrelated column on a dataset that has a JSON column.
+        // This should not fail with a schema mismatch error.
+        let update_result = UpdateBuilder::new(Arc::new(ds))
+            .update_where("id = 1")
+            .unwrap()
+            .set("name", "'updated'")
+            .unwrap()
+            .build()
+            .unwrap()
+            .execute()
+            .await
+            .unwrap();
+
+        let dataset = update_result.new_dataset;
+        let actual_batches = dataset
+            .scan()
+            .try_into_stream()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let actual_batch = concat_batches(&actual_batches[0].schema(), &actual_batches).unwrap();
+
+        // Collect (id, name) pairs and sort by id for order-independent assertion
+        let ids = actual_batch
+            .column_by_name("id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let names = actual_batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut rows: Vec<(i64, String)> = (0..actual_batch.num_rows())
+            .map(|i| (ids.value(i), names.value(i).to_string()))
+            .collect();
+        rows.sort_by_key(|(id, _)| *id);
+
+        assert_eq!(rows, vec![(0, "a".into()), (1, "updated".into()), (2, "c".into())]);
     }
 }
